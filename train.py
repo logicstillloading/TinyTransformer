@@ -416,8 +416,9 @@ def run_mini_inference(
     print(f"| MINI-INFERENCE GENERATION TEST AT STEP {step:06d} (max_new_tokens={max_new_tokens})")
     print("=" * 70)
 
+    is_xla = "xla" in str(device)
     autocast_device = "cuda" if "cuda" in str(device) else "cpu"
-    autocast_dtype = dtype if autocast_device == "cuda" else (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32)
+    autocast_dtype = dtype if autocast_device == "cuda" else torch.bfloat16
     for p_idx, prompt in enumerate(INFER_PROMPTS, 1):
         encoded = tokenizer.encode(prompt, add_bos=True)
         input_ids = torch.tensor([encoded], dtype=torch.long, device=device)
@@ -648,7 +649,7 @@ def train():
         missing, unexpected = model.load_state_dict(resumed_ckpt["model_state_dict"], strict=False)
         print(f"[resume] missing={missing} unexpected={unexpected}")
         assert not missing, "checkpoint doesn't match model"
-        cast_model_dtypes(model, is_cuda_dev, dtype)
+        cast_model_dtypes(model, is_cuda_dev or is_tpu_dev, dtype)
         critic.load_state_dict(resumed_ckpt["critic_state_dict"], strict=False)
         muon_sd = resumed_ckpt.get("opt_muon_state_dict") or resumed_ckpt.get("muon_state_dict")
         adam_sd = resumed_ckpt.get("opt_adam_state_dict") or resumed_ckpt.get("adam_state_dict")
@@ -817,7 +818,7 @@ def train():
     model.train()
     critic.train()
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16 and is_cuda_dev))
+    scaler = torch.amp.GradScaler("cuda", enabled=(dtype == torch.float16 and is_cuda_dev)) if is_cuda_dev else torch.amp.GradScaler("cpu", enabled=False)
     if scaler.is_enabled():
         print("[*] FP16 GradScaler enabled for numerical stability on Turing/T4 Tensor Cores.")
 
@@ -841,13 +842,13 @@ def train():
     while step < args.max_steps:
         step += 1
         step_tokens = 0
-        accum_loss_lm_tensor = torch.zeros(1, device=args.device)
-        accum_aux_loss_tensor = torch.zeros(1, device=args.device)
-        accum_loss_critic_tensor = torch.zeros(1, device=args.device)
-        accum_loss_adv_tensor = torch.zeros(1, device=args.device)
-        accum_reward_tensor = torch.zeros(1, device=args.device)
-        accum_real_acc_tensor = torch.zeros(1, device=args.device)
-        accum_fake_acc_tensor = torch.zeros(1, device=args.device)
+        accum_loss_lm_tensor = torch.zeros(1, device=target_device)
+        accum_aux_loss_tensor = torch.zeros(1, device=target_device)
+        accum_loss_critic_tensor = torch.zeros(1, device=target_device)
+        accum_loss_adv_tensor = torch.zeros(1, device=target_device)
+        accum_reward_tensor = torch.zeros(1, device=target_device)
+        accum_real_acc_tensor = torch.zeros(1, device=target_device)
+        accum_fake_acc_tensor = torch.zeros(1, device=target_device)
         accum_loss_adv = 0.0
         accum_reward = 0.0
         accum_real_acc = 0.0
@@ -969,8 +970,8 @@ def train():
                         adv_loss_val = loss_adv.item()
                 else:
                     loss_adv_scaled = 0.0
-                    reward_val = torch.tensor(0.5, device=args.device) if is_tpu_dev else 0.5
-                    adv_loss_val = torch.tensor(0.0, device=args.device) if is_tpu_dev else 0.0
+                    reward_val = torch.tensor(0.5, device=target_device) if is_tpu_dev else 0.5
+                    adv_loss_val = torch.tensor(0.0, device=target_device) if is_tpu_dev else 0.0
 
                 loss_total = loss_lm_scaled + loss_adv_scaled
                 scaler.scale(loss_total).backward()
@@ -982,12 +983,12 @@ def train():
                 )
                 scaler.scale(loss_critic / num_critic_micro).backward()
 
-                accum_loss_critic_tensor.add_(loss_critic.detach().to(args.device) / num_critic_micro)
+                accum_loss_critic_tensor.add_(loss_critic.detach().to(target_device) / num_critic_micro)
                 if is_tpu_dev:
-                    accum_loss_adv_tensor.add_(adv_loss_val.to(args.device) / num_critic_micro)
-                    accum_reward_tensor.add_(reward_val.to(args.device) / num_critic_micro)
-                    accum_real_acc_tensor.add_(real_acc.to(args.device) / num_critic_micro)
-                    accum_fake_acc_tensor.add_(fake_acc.to(args.device) / num_critic_micro)
+                    accum_loss_adv_tensor.add_(adv_loss_val.to(target_device) / num_critic_micro)
+                    accum_reward_tensor.add_(reward_val.to(target_device) / num_critic_micro)
+                    accum_real_acc_tensor.add_(real_acc.to(target_device) / num_critic_micro)
+                    accum_fake_acc_tensor.add_(fake_acc.to(target_device) / num_critic_micro)
                 else:
                     accum_loss_adv += adv_loss_val / num_critic_micro
                     accum_reward += reward_val / num_critic_micro
