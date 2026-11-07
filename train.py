@@ -137,12 +137,13 @@ def _state_to_cpu(obj):
         return obj
 
 
-def _async_save_worker(state: Dict[str, Any], checkpoint_dir: str):
+def _async_save_worker(state: Dict[str, Any], checkpoint_dir: str, prefix: str = "checkpoint"):
     os.makedirs(checkpoint_dir, exist_ok=True)
-    latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
-    prev_path = os.path.join(checkpoint_dir, "checkpoint_prev.pt")
-    tmp_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt.tmp")
-    hp_path = os.path.join(checkpoint_dir, "hyperparameters.json")
+    latest_path = os.path.join(checkpoint_dir, f"{prefix}_latest.pt" if prefix != "checkpoint" else "checkpoint_latest.pt")
+    prev_path = os.path.join(checkpoint_dir, f"{prefix}_prev.pt" if prefix != "checkpoint" else "checkpoint_prev.pt")
+    tmp_path = os.path.join(checkpoint_dir, f"{prefix}_latest.pt.tmp")
+    hp_path = os.path.join(checkpoint_dir, f"{prefix}_hyperparameters.json" if prefix != "checkpoint" else "hyperparameters.json")
+    manifest_path = os.path.join(checkpoint_dir, f"{prefix}_manifest.json" if prefix != "checkpoint" else "checkpoint_manifest.json")
 
     # 1. Write to temporary file
     torch.save(state, tmp_path)
@@ -170,6 +171,14 @@ def _async_save_worker(state: Dict[str, Any], checkpoint_dir: str):
     # 4. Atomic rename tmp to latest
     os.replace(tmp_path, latest_path)
 
+    # If saving with specific prefix (e.g. checkpoint_base or checkpoint_instruct), mirror to checkpoint_latest.pt for seamless --resume
+    if prefix != "checkpoint":
+        standard_latest = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+        try:
+            shutil.copy2(latest_path, standard_latest)
+        except Exception:
+            pass
+
     # 5. Write human-readable hyperparameters JSON
     hp = state.get("hyperparameters", {})
     if hp:
@@ -180,11 +189,11 @@ def _async_save_worker(state: Dict[str, Any], checkpoint_dir: str):
             pass
 
     # 6. Write human-readable checkpoint manifest JSON with full reconstructibility lineage
-    manifest_path = os.path.join(checkpoint_dir, "checkpoint_manifest.json")
     try:
         manifest_data = {
             "step": state.get("step"),
             "tokens_processed": state.get("tokens_processed"),
+            "phase": state.get("phase", "foundation"),
             "metrics": state.get("metrics"),
             "session_info": state.get("session_info"),
             "session_history": state.get("session_history"),
@@ -198,7 +207,7 @@ def _async_save_worker(state: Dict[str, Any], checkpoint_dir: str):
     except Exception as e:
         print(f"[Manifest Warning] Could not write manifest: {e}")
 
-    print(f"[*] [Async Save] Checkpoint at step {state['step']} successfully persisted to disk in background.")
+    print(f"[*] [Async Save] Checkpoint ({prefix}) at step {state['step']} successfully persisted to disk in background.")
     del state
     gc.collect()
 
@@ -229,6 +238,7 @@ def save_atomic_checkpoint(
     session_history: Optional[List[Dict[str, Any]]] = None,
     sync: bool = True,
     single_checkpoint: bool = False,
+    prefix: str = "checkpoint",
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
     wait_for_async_save()
@@ -255,6 +265,7 @@ def save_atomic_checkpoint(
     raw_state = {
         "step": step,
         "tokens_processed": tokens_processed,
+        "phase": getattr(dataset, "phase", "foundation"),
         "model_state_dict": model.state_dict(),
         "critic_state_dict": critic.state_dict(),
         "opt_muon_state_dict": muon_sd,
@@ -281,12 +292,12 @@ def save_atomic_checkpoint(
     del raw_state
 
     if sync:
-        _async_save_worker(cpu_state, checkpoint_dir)
+        _async_save_worker(cpu_state, checkpoint_dir, prefix=prefix)
     else:
         # Launch disk save in background thread so training continues without stalling GPU
         global _save_thread
         with _save_lock:
-            _save_thread = threading.Thread(target=_async_save_worker, args=(cpu_state, checkpoint_dir), daemon=False)
+            _save_thread = threading.Thread(target=_async_save_worker, args=(cpu_state, checkpoint_dir, prefix), daemon=False)
             _save_thread.start()
 
 
@@ -734,6 +745,12 @@ def _train_worker(rank: int, args):
         resume_state=dataset_resume_state,
         effective_batch_size=args.batch_size * args.grad_accum,
     )
+    current_phase = getattr(dataset, "phase", "foundation")
+    if total_tokens_processed >= args.base_tokens and current_phase == "foundation":
+        current_phase = "instruct"
+        dataset.set_phase("instruct", instruct_ratio=args.instruct_mix_ratio)
+        if is_master:
+            print(f"[*] Resumed directly into Phase 2: {args.instruct_mix_tokens/1e6:.0f}M Instruct + Foundation Annealing Mix.")
     data_iter = iter(dataset)
 
     # 6. Session Logger (Separate timestamped CSV & JSONL with lineage tracking)
@@ -774,6 +791,10 @@ def _train_worker(rank: int, args):
         "lr_warmup_steps": args.lr_warmup_steps,
         "lr_decay_steps": args.lr_decay_steps,
         "lr_min_ratio": args.lr_min_ratio,
+        "base_tokens": args.base_tokens,
+        "instruct_mix_tokens": args.instruct_mix_tokens,
+        "instruct_mix_ratio": args.instruct_mix_ratio,
+        "phase": current_phase,
         "critic_lr": args.critic_lr,
         "critic_start_tokens": args.critic_start_tokens,
         "critic_ramp_tokens": args.critic_ramp_tokens,
@@ -851,6 +872,8 @@ def _train_worker(rank: int, args):
         print(f"* Device / Dtype:    {args.device.upper()} / {args.dtype} (Cores: {world_size})")
         print(f"* Batch Config:      Micro-batch {args.batch_size} x Accum {args.grad_accum} x {world_size} Cores (Effective: {args.batch_size * args.grad_accum * args.seq_len * world_size:,} tokens/step)")
         print(f"* Chinchilla Target: 2.60 Billion tokens ({total_tokens_processed/1e6:.2f}M seen, {total_tokens_processed / CHINCHILLA_TARGET * 100:.3f}% reached)")
+        print(f"* Pretraining Plan:  Phase 1 Base: {args.base_tokens/1e6:,.0f}M tok | Phase 2 Instruct-Mix: {args.instruct_mix_tokens/1e6:,.0f}M tok ({args.instruct_mix_ratio*100:.0f}% instruct)")
+        print(f"* Checkpoints:       Base: {args.checkpoint_dir}/checkpoint_base_latest.pt | Instruct: {args.checkpoint_dir}/checkpoint_instruct_latest.pt")
         print(f"* Session Log:       {csv_log_path}")
         print("=" * 80 + "\n")
 
@@ -1117,6 +1140,52 @@ def _train_worker(rank: int, args):
 
         total_tokens_processed += step_tokens
 
+        # Check for Phase Transition: Foundation -> Instruct + Foundation Annealing Mix
+        if current_phase == "foundation" and total_tokens_processed >= args.base_tokens:
+            current_phase = "instruct"
+            dataset.set_phase("instruct", instruct_ratio=args.instruct_mix_ratio)
+            current_hyperparameters["phase"] = "instruct"
+            if is_master:
+                wait_for_async_save()
+                s_info, full_hist = get_session_metadata(step, total_tokens_processed)
+                save_metrics = {
+                    "ema_loss": ema_loss or accum_loss_lm,
+                    "ema_ppl": ema_ppl or math.exp(min(accum_loss_lm, 20.0)),
+                    "current_loss": accum_loss_lm,
+                    "current_ppl": math.exp(min(accum_loss_lm, 20.0)),
+                    "phase": "foundation_complete",
+                }
+                save_atomic_checkpoint(
+                    checkpoint_dir=args.checkpoint_dir,
+                    step=step,
+                    tokens_processed=total_tokens_processed,
+                    model=model,
+                    critic=critic,
+                    optimizers=optimizers,
+                    dataset=dataset,
+                    metrics=save_metrics,
+                    hyperparameters=current_hyperparameters,
+                    session_info=s_info,
+                    session_history=full_hist,
+                    sync=True,
+                    single_checkpoint=getattr(args, "single_checkpoint", False),
+                    prefix="checkpoint_base",
+                )
+                print("\n" + "=" * 80)
+                print("  [★ MILESTONE] BASE FOUNDATION PRETRAINING COMPLETE!")
+                print(f"  * Tokens Processed: {total_tokens_processed:,} ({total_tokens_processed/1e6:.1f}M tokens)")
+                print(f"  * Base Checkpoint:  {args.checkpoint_dir}/checkpoint_base_latest.pt")
+                print(f"  * Transitioning to: Phase 2 ({args.instruct_mix_tokens/1e6:.0f}M Instruct + Foundation Annealing Mix)")
+                print(f"  * Mixture Weights:  {args.instruct_mix_ratio*100:.0f}% Instruction | {(1.0-args.instruct_mix_ratio)*100:.0f}% Foundation Replay")
+                print("=" * 80 + "\n", flush=True)
+
+        # Check for total pretraining completion
+        total_chinchilla_target = args.base_tokens + args.instruct_mix_tokens
+        if total_tokens_processed >= total_chinchilla_target:
+            if is_master:
+                print(f"\n[★ COMPLETE] Reached total pretraining target of {total_tokens_processed:,} tokens! All phases complete.")
+            break
+
         # Moving averages
         current_loss = accum_loss_lm
         current_ppl = math.exp(min(current_loss, 20.0))
@@ -1172,6 +1241,13 @@ def _train_worker(rank: int, args):
                 else:
                     critic_cli = f"Critic: [Act: α={alpha:.2f}, β={beta:.2f}, Closs={accum_loss_critic:.2f}, Acc={0.5*(accum_real_acc+accum_fake_acc):.2f}]"
 
+            # Phase indicator
+            if current_phase == "foundation":
+                phase_cli = f"Ph:[Base {total_tokens_processed/max(1, args.base_tokens)*100:4.1f}%]"
+            else:
+                instruct_done = total_tokens_processed - args.base_tokens
+                phase_cli = f"Ph:[Instruct-Mix {instruct_done/max(1, args.instruct_mix_tokens)*100:4.1f}%]"
+
             # Goated Terminal Print
             pct_chinchilla = (total_tokens_processed / CHINCHILLA_TARGET) * 100.0
             gn_str = " ".join(f"{k}:{float(v):.2f}" for k, v in gn.items())
@@ -1181,6 +1257,7 @@ def _train_worker(rank: int, args):
                 f"PPL: {current_ppl:6.1f} (avg: {ema_ppl:6.1f}) | "
                 f"LR: [M:{curr_lr_muon:.5f}|A:{curr_lr_adam:.2e}] | "
                 f"GN: [{gn_str}] | "
+                f"{phase_cli} | "
                 f"{critic_cli} | "
                 f"Tokens: {total_tokens_processed:,} ({total_tokens_processed/1e6:5.2f}M | {tok_per_sec:5.0f} t/s | {pct_chinchilla:.3f}%) | "
                 f"RAM: {ram_mb:4.0f}MB (priv {uss_mb:4.0f}) | "
@@ -1315,7 +1392,9 @@ def _train_worker(rank: int, args):
                 "ema_ppl": ema_ppl,
                 "current_loss": current_loss,
                 "current_ppl": current_ppl,
+                "phase": current_phase,
             }
+            active_prefix = "checkpoint_instruct" if current_phase == "instruct" else "checkpoint_base"
             save_atomic_checkpoint(
                 checkpoint_dir=args.checkpoint_dir,
                 step=step,
@@ -1330,8 +1409,9 @@ def _train_worker(rank: int, args):
                 session_history=full_hist,
                 sync=(step == args.max_steps),
                 single_checkpoint=getattr(args, "single_checkpoint", False),
+                prefix=active_prefix,
             )
-            print(f"[*] Checkpoint atomically saved at step {step} to {args.checkpoint_dir}/checkpoint_latest.pt")
+            print(f"[*] Checkpoint ({active_prefix}) atomically saved at step {step} to {args.checkpoint_dir}/{active_prefix}_latest.pt")
 
             # Milestone Checkpoint Archiving with .md and .json reports (every 1,000 steps by default)
             if args.archive_interval > 0 and step % args.archive_interval == 0 and step > 0:
@@ -1412,11 +1492,36 @@ def _train_worker(rank: int, args):
 
     if is_master:
         wait_for_async_save()
+        s_info, full_hist = get_session_metadata(step, total_tokens_processed)
+        save_metrics = {
+            "ema_loss": ema_loss,
+            "ema_ppl": ema_ppl,
+            "current_loss": current_loss,
+            "current_ppl": current_ppl,
+            "phase": current_phase,
+        }
+        active_prefix = "checkpoint_instruct" if current_phase == "instruct" else "checkpoint_base"
+        save_atomic_checkpoint(
+            checkpoint_dir=args.checkpoint_dir,
+            step=step,
+            tokens_processed=total_tokens_processed,
+            model=model,
+            critic=critic,
+            optimizers=optimizers,
+            dataset=dataset,
+            metrics=save_metrics,
+            hyperparameters=current_hyperparameters,
+            session_info=s_info,
+            session_history=full_hist,
+            sync=True,
+            single_checkpoint=getattr(args, "single_checkpoint", False),
+            prefix=active_prefix,
+        )
         if csv_file:
             csv_file.close()
         if jsonl_file:
             jsonl_file.close()
-        print("\n[OK] Pretraining completed successfully!")
+        print(f"\n[OK] Pretraining completed successfully! Final checkpoint saved to {args.checkpoint_dir}/{active_prefix}_latest.pt")
 
 
 def train():
@@ -1460,6 +1565,9 @@ def train():
     parser.add_argument("--cloud-url", type=str, default=None, help="Direct HTTP/HTTPS checkpoint URL")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed for dataset sampling")
     parser.add_argument("--single-checkpoint", action="store_true", default=False, help="Keep only one latest checkpoint (no checkpoint_prev.pt) to conserve cloud disk space")
+    parser.add_argument("--base-tokens", type=int, default=2_400_000_000, help="Foundation pretraining token target before switching to instruct mix (default: 2.4B)")
+    parser.add_argument("--instruct-mix-tokens", type=int, default=200_000_000, help="Tokens for instruction + foundation annealing mix (default: 200M)")
+    parser.add_argument("--instruct-mix-ratio", type=float, default=0.50, help="Proportion of instruction data during instruct-mix phase (default: 0.50)")
     parser.add_argument("--tpu-cores", type=int, default=None, choices=[1, 8], help="Number of TPU cores (1 or 8 for Kaggle TPU v3-8)")
     args = parser.parse_args()
 

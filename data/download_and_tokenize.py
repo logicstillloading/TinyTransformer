@@ -100,6 +100,7 @@ def download_and_tokenize_stream(
     tokens_written = 0
     t0 = time.time()
     last_print = t0
+    epoch = 1
 
     progress_path = os.path.join(shard_dir, f"{name}_progress.json")
     docs_seen = 0
@@ -127,6 +128,9 @@ def download_and_tokenize_stream(
             else:
                 text = sample.get("text", "")
         except StopIteration:
+            epoch += 1
+            print(f"    [*] Epoch {epoch} completed for '{name}'. Resetting deduplication cache for diverse multi-epoch tokenization...", flush=True)
+            seen_docs.clear()
             ds = _get_dataset(cfg, 0)
             docs_seen = 0
             it = iter(ds)
@@ -224,6 +228,7 @@ def download_and_tokenize(
     shard_dir: str = "data/shards",
     tokenizer_path: str = "tokenizer.json",
     stream_filter: Optional[str] = None,
+    phase: str = "all",
 ):
     os.makedirs(shard_dir, exist_ok=True)
     tokenizer = get_or_create_tokenizer(tokenizer_path)
@@ -234,14 +239,27 @@ def download_and_tokenize(
     print(f"* Target Total Tokens: {target_tokens:,} ({target_tokens / 1e6:.1f} Million)")
     print(f"* Shard Directory:     {shard_dir}")
     print(f"* Shard Size:          {shard_size:,} tokens (~{shard_size * 2 / (1024*1024):.1f} MB in uint16)")
+    print(f"* Phase:               {phase.upper()}")
     if stream_filter:
         print(f"* Stream Filter:       {stream_filter}")
     print("=" * 70)
 
-    for cfg in STREAM_CONFIGS:
+    # Filter by phase
+    if phase == "instruct":
+        active_configs = [c for c in STREAM_CONFIGS if c["name"] == "instruction"]
+    elif phase == "foundation":
+        active_configs = [c for c in STREAM_CONFIGS if c["name"] != "instruction"]
+    else:
+        active_configs = list(STREAM_CONFIGS)
+
+    # Re-normalize weights if subset
+    tot_weight = sum(c["weight"] for c in active_configs)
+    normalized_configs = [{**c, "weight": c["weight"] / tot_weight} for c in active_configs]
+
+    for cfg in normalized_configs:
         if stream_filter and cfg["name"] != stream_filter:
             continue
-        stream_target = target_tokens if stream_filter else int(target_tokens * cfg["weight"])
+        stream_target = target_tokens if (stream_filter or len(normalized_configs) == 1) else int(target_tokens * cfg["weight"])
         download_and_tokenize_stream(
             cfg=cfg,
             target_tokens=stream_target,
@@ -268,6 +286,7 @@ if __name__ == "__main__":
     parser.add_argument("--shard-dir", type=str, default="data/shards", help="Directory to save shards")
     parser.add_argument("--tokenizer", type=str, default="tokenizer.json", help="Path to tokenizer.json")
     parser.add_argument("--stream", type=str, default=None, help="Filter to specific stream (e.g. python, cosmopedia)")
+    parser.add_argument("--phase", type=str, default="all", choices=["all", "foundation", "instruct"], help="Tokenize foundation, instruct, or all streams")
     args = parser.parse_args()
 
     download_and_tokenize(
@@ -276,4 +295,5 @@ if __name__ == "__main__":
         shard_dir=args.shard_dir,
         tokenizer_path=args.tokenizer,
         stream_filter=args.stream,
+        phase=args.phase,
     )

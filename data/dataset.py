@@ -71,6 +71,9 @@ class StreamingDatasetMixture(IterableDataset):
         self.effective_batch_size = max(4, effective_batch_size)
         self.weights = [cfg["weight"] for cfg in STREAM_CONFIGS]
         self.names = [cfg["name"] for cfg in STREAM_CONFIGS]
+        self.phase: str = "foundation"
+        self.instruct_ratio: float = 0.50
+        self.stream_epochs: Dict[str, int] = {cfg["name"]: 0 for cfg in STREAM_CONFIGS}
 
         # Scan for NVMe memory-mapped shards
         self.stream_memmaps: Dict[str, List[np.memmap]] = {}
@@ -121,11 +124,40 @@ class StreamingDatasetMixture(IterableDataset):
                 self.stream_chunk_indices[name] = valid_chunks
                 self.stream_chunk_ptrs[name] = 0
 
+    def set_phase(self, phase: str = "foundation", instruct_ratio: float = 0.50):
+        """
+        Dynamically adjusts stream weights between Foundation Pretraining and
+        Instruction + Foundation Annealing Mix.
+
+        - 'foundation': Standard pretraining mixture (7% instruction, 93% foundation).
+        - 'instruct': Rebalances to instruct_ratio (e.g. 50% instruction, 50% foundation replay).
+        """
+        self.phase = phase
+        self.instruct_ratio = instruct_ratio
+        if phase == "instruct":
+            foundation_total = sum(cfg["weight"] for cfg in STREAM_CONFIGS if cfg["name"] != "instruction")
+            scale = (1.0 - instruct_ratio) / max(foundation_total, 1e-6)
+            new_weights = []
+            for cfg in STREAM_CONFIGS:
+                if cfg["name"] == "instruction":
+                    new_weights.append(instruct_ratio)
+                else:
+                    new_weights.append(cfg["weight"] * scale)
+            self.weights = new_weights
+            mix_breakdown = ", ".join(f"{cfg['name']}: {w*100:.1f}%" for cfg, w in zip(STREAM_CONFIGS, self.weights))
+            print(f"[Dataset] Transitioned to INSTRUCT-MIX phase: {mix_breakdown}")
+        else:
+            self.weights = [cfg["weight"] for cfg in STREAM_CONFIGS]
+            print(f"[Dataset] Set to FOUNDATION phase: Default pretraining mixture active.")
+
     def state_dict(self) -> Dict[str, Any]:
         return {
             "samples_consumed": dict(self.samples_consumed),
             "dataset_indices": dict(self.samples_consumed),  # GEMINI.md schema compatibility
             "tokens_processed": self.tokens_processed,
+            "phase": getattr(self, "phase", "foundation"),
+            "instruct_ratio": getattr(self, "instruct_ratio", 0.50),
+            "stream_epochs": dict(getattr(self, "stream_epochs", {})),
             "rng_state": self.rng.getstate(),
             "stream_buffers": {k: list(v) for k, v in self.stream_buffers.items()},
             "stream_queue": list(self.stream_queue),
@@ -134,6 +166,12 @@ class StreamingDatasetMixture(IterableDataset):
         }
 
     def load_state_dict(self, state: Dict[str, Any]):
+        if "phase" in state:
+            p = state["phase"]
+            ir = state.get("instruct_ratio", 0.50)
+            self.set_phase(p, instruct_ratio=ir)
+        if "stream_epochs" in state:
+            self.stream_epochs.update(state["stream_epochs"])
         if "samples_consumed" in state:
             self.samples_consumed.update(state["samples_consumed"])
         elif "dataset_indices" in state:
@@ -285,6 +323,8 @@ class StreamingDatasetMixture(IterableDataset):
                 # Reshuffle chunk offsets without replacement on epoch completion
                 self.rng.shuffle(indices)
                 ptr = 0
+                self.stream_epochs[name] = self.stream_epochs.get(name, 0) + 1
+                print(f"[Dataset] '{name}': Epoch {self.stream_epochs[name]} complete. Reshuffled {len(indices):,} chunks for next epoch.")
 
             mm_idx, offset = indices[ptr]
             self.stream_chunk_ptrs[name] = ptr + 1
