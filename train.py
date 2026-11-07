@@ -21,7 +21,17 @@ import os
 import shutil
 import sys
 
-# Configure UTF-8 stdout/stderr on Windows to avoid charmap UnicodeEncodeErrors during generation
+# Configure unbuffered line-buffered stdout/stderr for real-time telemetry streaming in Colab / Linux / Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(line_buffering=True, errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(line_buffering=True, errors="replace")
+    except Exception:
+        pass
 if sys.platform == "win32":
     import io
     if hasattr(sys.stdout, "buffer"):
