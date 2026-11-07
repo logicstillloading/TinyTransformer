@@ -5,7 +5,7 @@ Provides token-level and sequence-level discrimination scores to guide the gener
 """
 
 import math
-from typing import Tuple
+from typing import Tuple, Any, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -125,16 +125,22 @@ def compute_critic_loss(
     real_embeds: torch.Tensor,
     fake_embeds: torch.Tensor,
     label_smoothing: bool = True,
-) -> Tuple[torch.Tensor, float, float]:
+) -> Tuple[torch.Tensor, Any, Any]:
     """
     Trains the critic to assign 0.9 to real tokens and 0.1 to fake tokens (one-sided label smoothing)
     to prevent discriminator overconfidence and saturation.
     Uses detached embeddings so generator is not updated during critic step.
+    Optimized for zero device-to-host stalling on TPU / XLA.
     """
-    autocast_device = "cuda" if "cuda" in str(real_embeds.device.type) else "cpu"
-    with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
+    is_xla = "xla" in str(real_embeds.device.type)
+    if is_xla:
         real_token_logits, real_seq_logits = critic(real_embeds.detach())
         fake_token_logits, fake_seq_logits = critic(fake_embeds.detach())
+    else:
+        autocast_device = "cuda" if "cuda" in str(real_embeds.device.type) else "cpu"
+        with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
+            real_token_logits, real_seq_logits = critic(real_embeds.detach())
+            fake_token_logits, fake_seq_logits = critic(fake_embeds.detach())
 
     real_target = torch.full_like(real_seq_logits, 0.9) if label_smoothing else torch.ones_like(real_seq_logits)
     fake_target = torch.full_like(fake_seq_logits, 0.1) if label_smoothing else torch.zeros_like(fake_seq_logits)
@@ -143,8 +149,12 @@ def compute_critic_loss(
     loss_fake = F.binary_cross_entropy_with_logits(fake_seq_logits.float(), fake_target)
     total_loss = 0.5 * (loss_real + loss_fake)
 
-    real_acc = (torch.sigmoid(real_seq_logits.float()) > 0.5).float().mean().item()
-    fake_acc = (torch.sigmoid(fake_seq_logits.float()) < 0.5).float().mean().item()
+    if is_xla:
+        real_acc = (torch.sigmoid(real_seq_logits.float()) > 0.5).float().mean()
+        fake_acc = (torch.sigmoid(fake_seq_logits.float()) < 0.5).float().mean()
+    else:
+        real_acc = (torch.sigmoid(real_seq_logits.float()) > 0.5).float().mean().item()
+        fake_acc = (torch.sigmoid(fake_seq_logits.float()) < 0.5).float().mean().item()
 
     return total_loss, real_acc, fake_acc
 
@@ -157,9 +167,13 @@ def compute_generator_adversarial_loss(
     Generator attempts to fool the critic into believing fake embeddings are real (1.0).
     Returns adversarial loss and reward bonus.
     """
-    autocast_device = "cuda" if "cuda" in str(fake_embeds.device.type) else "cpu"
-    with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
+    is_xla = "xla" in str(fake_embeds.device.type)
+    if is_xla:
         token_logits, seq_logits = critic(fake_embeds)
+    else:
+        autocast_device = "cuda" if "cuda" in str(fake_embeds.device.type) else "cpu"
+        with torch.amp.autocast(autocast_device, dtype=torch.bfloat16):
+            token_logits, seq_logits = critic(fake_embeds)
     # Target is 1.0 (real)
     loss_adv = F.binary_cross_entropy_with_logits(
         seq_logits.float(), torch.ones_like(seq_logits, dtype=torch.float32)

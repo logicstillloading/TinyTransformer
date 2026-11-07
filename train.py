@@ -848,6 +848,10 @@ def train():
         accum_loss_lm_tensor = torch.zeros(1, device=args.device)
         accum_aux_loss_tensor = torch.zeros(1, device=args.device)
         accum_loss_critic_tensor = torch.zeros(1, device=args.device)
+        accum_loss_adv_tensor = torch.zeros(1, device=args.device)
+        accum_reward_tensor = torch.zeros(1, device=args.device)
+        accum_real_acc_tensor = torch.zeros(1, device=args.device)
+        accum_fake_acc_tensor = torch.zeros(1, device=args.device)
         accum_loss_adv = 0.0
         accum_reward = 0.0
         accum_real_acc = 0.0
@@ -961,12 +965,16 @@ def train():
                 if beta > 0.0:
                     loss_adv, reward = compute_generator_adversarial_loss(critic, fake_embeds)
                     loss_adv_scaled = (beta * loss_adv) / num_critic_micro
-                    reward_val = reward.mean().item()
-                    adv_loss_val = loss_adv.item()
+                    if is_tpu_dev:
+                        reward_val = reward.mean().detach()
+                        adv_loss_val = loss_adv.detach()
+                    else:
+                        reward_val = reward.mean().item()
+                        adv_loss_val = loss_adv.item()
                 else:
                     loss_adv_scaled = 0.0
-                    reward_val = 0.5
-                    adv_loss_val = 0.0
+                    reward_val = torch.tensor(0.5, device=args.device) if is_tpu_dev else 0.5
+                    adv_loss_val = torch.tensor(0.0, device=args.device) if is_tpu_dev else 0.0
 
                 loss_total = loss_lm_scaled + loss_adv_scaled
                 scaler.scale(loss_total).backward()
@@ -979,10 +987,16 @@ def train():
                 scaler.scale(loss_critic / num_critic_micro).backward()
 
                 accum_loss_critic_tensor.add_(loss_critic.detach().to(args.device) / num_critic_micro)
-                accum_loss_adv += adv_loss_val / num_critic_micro
-                accum_reward += reward_val / num_critic_micro
-                accum_real_acc += real_acc / num_critic_micro
-                accum_fake_acc += fake_acc / num_critic_micro
+                if is_tpu_dev:
+                    accum_loss_adv_tensor.add_(adv_loss_val.to(args.device) / num_critic_micro)
+                    accum_reward_tensor.add_(reward_val.to(args.device) / num_critic_micro)
+                    accum_real_acc_tensor.add_(real_acc.to(args.device) / num_critic_micro)
+                    accum_fake_acc_tensor.add_(fake_acc.to(args.device) / num_critic_micro)
+                else:
+                    accum_loss_adv += adv_loss_val / num_critic_micro
+                    accum_reward += reward_val / num_critic_micro
+                    accum_real_acc += real_acc / num_critic_micro
+                    accum_fake_acc += fake_acc / num_critic_micro
             else:
                 scaler.scale(loss_lm_scaled).backward()
 
@@ -995,6 +1009,11 @@ def train():
         accum_aux_loss = accum_aux_loss_tensor.item() / args.grad_accum
         if critic_active:
             accum_loss_critic = accum_loss_critic_tensor.item()
+            if is_tpu_dev:
+                accum_loss_adv = accum_loss_adv_tensor.item()
+                accum_reward = accum_reward_tensor.item()
+                accum_real_acc = accum_real_acc_tensor.item()
+                accum_fake_acc = accum_fake_acc_tensor.item()
         else:
             accum_loss_critic = 0.0
             accum_real_acc = 0.5
