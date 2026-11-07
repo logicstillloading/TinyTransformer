@@ -82,6 +82,33 @@ notebook = {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
+                "### 2b. (Optional) Resume from Existing Checkpoint (~256M tokens / Step 7,811)\n",
+                "If you want to resume your previous training run rather than starting from Step 0, you can either:\n",
+                "1. Drag & drop `checkpoint_latest.pt` directly into your Google Drive folder: `MyDrive/TinyTransformer/checkpoints/checkpoint_latest.pt`, OR\n",
+                "2. Uncomment and run the code below to upload it directly from your computer into Drive."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# from google.colab import files\n",
+                "# import shutil\n",
+                "# print('Select checkpoint_latest.pt from your PC:')\n",
+                "# uploaded = files.upload()\n",
+                "# for fn in uploaded.keys():\n",
+                "#     if fn.endswith('.pt'):\n",
+                "#         dest = os.path.join(CHECKPOINT_DIR, 'checkpoint_latest.pt')\n",
+                "#         shutil.move(fn, dest)\n",
+                "#         print(f'[+] Checkpoint placed at: {dest}')\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
                 "## 3. Clone TinyTransformer Repository & Install Dependencies"
             ]
         },
