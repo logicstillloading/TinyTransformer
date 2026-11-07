@@ -106,11 +106,42 @@ def detect_hardware_profile(
             pass
 
     if is_tpu_env:
+        num_cores = 1
+        if XLA_AVAILABLE and xm is not None:
+            try:
+                num_cores = xm.xrt_world_size()
+            except Exception:
+                num_cores = 1
+        is_multi_core = num_cores > 1 or os.environ.get("TPU_CORES") == "8" or os.environ.get("KAGGLE_KERNEL_RUN_TYPE")
+
         if tpu_dev is None:
             if XLA_AVAILABLE and xm is not None:
                 tpu_dev = xm.xla_device()
             else:
                 tpu_dev = torch.device("tpu")
+
+        if is_multi_core:
+            mb = user_batch_size if (user_batch_size and user_batch_size > 0) else 4
+            ga = user_grad_accum if (user_grad_accum and user_grad_accum > 0) else max(1, TARGET_STEP_TOKENS // (mb * max(1, num_cores) * seq_len))
+            dt = torch.bfloat16
+            return HardwareProfile(
+                name=f"Kaggle / Cloud TPU v3-8 ({num_cores} Cores Distributed)",
+                hardware_category="tpu_v3_8",
+                device=tpu_dev,
+                device_str=str(tpu_dev),
+                dtype=dt,
+                dtype_str="bfloat16",
+                batch_size=mb,
+                grad_accum=ga,
+                target_tokens_per_step=mb * ga * max(1, num_cores) * seq_len,
+                use_grad_scaler=False,
+                use_grad_checkpoint=True,
+                is_tpu=True,
+                is_cuda=False,
+                vram_gb=16.0 * max(1, num_cores),
+                description=f"TPU v3-8 Cluster with {num_cores} Parallel Cores ({16.0 * max(1, num_cores):.0f} GB HBM) via PyTorch/XLA",
+            )
+
         mb = user_batch_size if (user_batch_size and user_batch_size > 0) else 8
         ga = user_grad_accum if (user_grad_accum and user_grad_accum > 0) else max(1, TARGET_STEP_TOKENS // (mb * seq_len))
         dt = torch.bfloat16

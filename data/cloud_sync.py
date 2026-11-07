@@ -143,7 +143,39 @@ def download_from_hf(repo_id: str, filename: str = "checkpoint_latest.pt", local
 
 def download_from_drive(file_id: str, dest_path: str) -> bool:
     """Downloads a public Google Drive file with stream verification and safe rollback."""
+    import re
+    if "drive.google.com" in file_id or "/" in file_id:
+        m = re.search(r"[-_\w]{25,}", file_id)
+        if m:
+            file_id = m.group(0)
+
     print(f"[*] [CloudSync] Pulling checkpoint from Google Drive (ID: {file_id})...")
+    os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+    tmp_path = dest_path + ".tmp"
+
+    # Try fast gdown transfer first if available
+    try:
+        import gdown
+        print(f"[*] [CloudSync] Using gdown for fast chunked transfer...")
+        gdown.download(id=file_id, output=tmp_path, quiet=False, fuzzy=True)
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 50 * 1024 * 1024:
+            valid, msg, info = verify_checkpoint_integrity(tmp_path)
+            if valid:
+                if os.path.exists(dest_path):
+                    os.remove(dest_path)
+                os.replace(tmp_path, dest_path)
+                print(f"[+] [CloudSync Verified] Step {info['step']:,} successfully installed to: {dest_path}")
+                return True
+            else:
+                print(f"[!] [CORRUPTION REJECTED] Download failed integrity check: {msg}")
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                return False
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[*] gdown encountered exception, falling back to direct HTTP stream: {e}")
+
     session = requests.Session()
     url = "https://docs.google.com/uc?export=download"
     params = {"id": file_id, "confirm": "t"}
@@ -320,6 +352,9 @@ def sync_cloud_checkpoint(
     # 2. Google Drive
     if drive_id:
         if download_from_drive(file_id=drive_id, dest_path=dest_path):
+            return dest_path
+    elif url and ("drive.google.com" in url or "drive.usercontent.google.com" in url):
+        if download_from_drive(file_id=url, dest_path=dest_path):
             return dest_path
 
     # 3. Direct URL

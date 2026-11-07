@@ -503,55 +503,56 @@ def eval_fixed(model, shard_paths, device, n_windows=16, seq_len=1024):
     return out
 
 
-def train():
-    parser = argparse.ArgumentParser(description="TinyTransformer Pretraining Script")
-    parser.add_argument("--batch-size", type=int, default=None, help="Per-device micro-batch size (auto-tuned if not set)")
-    parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (auto-tuned if not set)")
-    parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length in tokens")
-    parser.add_argument("--max-steps", type=int, default=100_000_000, help="Maximum pretraining steps")
-    parser.add_argument("--lr-muon", type=float, default=0.006, help="Learning rate for Muon optimizer (default: 0.006)")
-    parser.add_argument("--lr-adam", type=float, default=3e-4, help="Learning rate for AdamW optimizer")
-    parser.add_argument("--lr-warmup-steps", type=int, default=50, help="Linear warmup steps (default: 50 for smooth early learning)")
-    parser.add_argument("--lr-decay-steps", type=int, default=79_000, help="Cosine decay target steps matching 2.6B token Chinchilla target (79k steps at 32k tokens/step)")
-    parser.add_argument("--lr-min-ratio", type=float, default=0.1, help="Minimum learning rate ratio at the end of decay")
-    parser.add_argument("--grad-checkpoint", action="store_true", default=True, help="Enable activation checkpointing for maximum VRAM headroom")
-    parser.add_argument("--no-grad-checkpoint", action="store_false", dest="grad_checkpoint", help="Disable activation checkpointing")
-    parser.add_argument("--critic-lr", type=float, default=1e-4, help="Learning rate for Critic optimizer")
-    parser.add_argument("--critic-start-tokens", type=int, default=250_000_000, help="Cumulative token threshold before activating adversarial RL loss")
-    parser.add_argument("--critic-ramp-tokens", type=int, default=100_000_000, help="Token count over which alpha/beta convex blending ramps")
-    parser.add_argument("--critic-start-step", "--critic-warmup-steps", type=int, default=7_500, help="Legacy step threshold before activating adversarial RL loss")
-    parser.add_argument("--critic-loss-target", type=float, default=2.4, help="Loss target threshold below which critic co-training activates (default: 2.4)")
-    parser.add_argument("--adv-weight", type=float, default=0.3, help="Max adversarial loss weight for generator (default: 0.3)")
-    parser.add_argument("--enable-critic", action="store_true", help="Enable co-training of the auxiliary critic model")
-    parser.add_argument("--critic-slice-len", type=int, default=256, help="Sequence length slice for Critic Gumbel-Softmax evaluation to reduce VRAM (default: 256)")
-    parser.add_argument("--critic-accum-steps", type=int, default=2, help="Number of micro-batches per optimizer step to evaluate Critic on (default: 2)")
-    parser.add_argument("--save-interval", type=int, default=250, help="Checkpoint save interval")
-    parser.add_argument("--infer-interval", type=int, default=1250, help="Mini-inference interval (5x increased: 1250 steps)")
-    parser.add_argument("--archive-interval", type=int, default=2500, help="Checkpoint archive interval with .md and .json reports (default: 2500 steps)")
-    parser.add_argument("--log-interval", type=int, default=10, help="Console logging interval")
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint_latest.pt")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoints directory")
-    parser.add_argument("--log-dir", type=str, default="logs", help="Session logs directory")
-    parser.add_argument("--device", type=str, default=None, help="Device to run on (cuda, xla, or cpu - auto-detected if None)")
-    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"],
-                        help="Compute dtype (auto selects bfloat16 on Ampere/Ada/Hopper or float16 on T4/V100 for maximum Tensor Core throughput)")
-    parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile for maximum kernel fusion speed")
-    parser.add_argument("--auto-profile", action="store_true", default=True, help="Auto-tune for RTX 3050 Ti, Tesla T4, or TPU v5e")
-    parser.add_argument("--cloud-sync", "--pull-cloud", action="store_true", help="Check and download latest checkpoint from cloud before resuming")
-    parser.add_argument("--hf-repo", type=str, default=None, help="Hugging Face repo ID for cloud checkpoint sync (e.g. username/repo)")
-    parser.add_argument("--drive-id", type=str, default=None, help="Google Drive file ID for checkpoint sync")
-    parser.add_argument("--cloud-url", type=str, default=None, help="Direct HTTP/HTTPS checkpoint URL")
-    args = parser.parse_args()
-
+def _train_worker(rank: int, args):
     # Hardware acceleration flags (Ampere Tensor Core TF32 & cuDNN auto-tuner)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    # 0. Cloud Checkpoint Auto-Sync (Plug & Play resumption across PC & Cloud)
+    # Multi-core rank and world-size detection
+    is_master = (rank == 0)
+    world_size = 1
+    if XLA_AVAILABLE and xm is not None:
+        try:
+            world_size = xm.xrt_world_size()
+            rank = xm.get_ordinal()
+            is_master = xm.is_master_ordinal()
+        except Exception:
+            pass
+
+    # 0. Checkpoint Auto-Discovery across Cloud & Kaggle directories
     latest_ckpt_path = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
-    if (args.resume and not os.path.exists(latest_ckpt_path)) or getattr(args, "cloud_sync", False):
+    if is_master and args.resume and not os.path.exists(latest_ckpt_path):
+        candidate_paths = [
+            "/kaggle/input/tinytransformer-checkpoint/checkpoint_latest.pt",
+            "/kaggle/input/tinytransformer/checkpoint_latest.pt",
+            "/kaggle/input/checkpoint_latest.pt",
+            "/kaggle/working/checkpoints/checkpoint_latest.pt",
+            "/content/drive/MyDrive/TinyTransformer/checkpoints/checkpoint_latest.pt",
+        ]
+        if os.path.exists("/kaggle/input"):
+            candidate_paths.extend(glob.glob("/kaggle/input/**/checkpoint_latest.pt", recursive=True))
+
+        for cand in candidate_paths:
+            if os.path.exists(cand):
+                print(f"[+] [Kaggle/Cloud Discovery] Found checkpoint at: {cand}")
+                os.makedirs(args.checkpoint_dir, exist_ok=True)
+                try:
+                    shutil.copy2(cand, latest_ckpt_path)
+                    print(f"[+] Successfully staged to {latest_ckpt_path}")
+                except Exception:
+                    try:
+                        os.symlink(cand, latest_ckpt_path)
+                    except Exception:
+                        pass
+                break
+
+    if getattr(args, "drive_url", None):
+        args.cloud_url = args.cloud_url or args.drive_url
+
+    # Cloud Checkpoint Auto-Sync (Google Drive / Hugging Face)
+    if is_master and ((args.resume and not os.path.exists(latest_ckpt_path)) or getattr(args, "cloud_sync", False)):
         print(f"[*] [CloudSync] Checking cloud for latest checkpoint ({latest_ckpt_path} missing or sync requested)...")
         synced = sync_cloud_checkpoint(
             checkpoint_dir=args.checkpoint_dir,
@@ -563,23 +564,29 @@ def train():
         if synced and os.path.exists(synced):
             print(f"[+] [CloudSync] Ready to resume from: {synced}")
 
+    if world_size > 1 and XLA_AVAILABLE and xm is not None:
+        xm.rendezvous("checkpoint_staged")
+
     # Auto-restore hyperparameters from checkpoint if resuming
     resumed_ckpt = None
     if args.resume and os.path.exists(latest_ckpt_path):
-        print(f"[*] Inspecting checkpoint for saved hyperparameters: {latest_ckpt_path}")
+        if is_master:
+            print(f"[*] Inspecting checkpoint for saved hyperparameters: {latest_ckpt_path}")
         resumed_ckpt = torch.load(latest_ckpt_path, map_location="cpu", weights_only=False)
         saved_hp = resumed_ckpt.get("hyperparameters", {})
         if saved_hp:
-            print("[*] Automatically restoring saved hyperparameters:")
+            if is_master:
+                print("[*] Automatically restoring saved hyperparameters:")
             for hp_key, hp_val in saved_hp.items():
                 cli_flag_1 = f"--{hp_key.replace('_', '-')}"
                 cli_flag_2 = f"--{hp_key}"
                 # If user did NOT explicitly override flag on CLI, restore saved value
                 if (cli_flag_1 not in sys.argv and cli_flag_2 not in sys.argv) and hasattr(args, hp_key):
                     setattr(args, hp_key, hp_val)
-                    print(f"    • {hp_key}: {hp_val}")
+                    if is_master:
+                        print(f"    • {hp_key}: {hp_val}")
 
-    # Dynamic Hardware Profile Auto-Tuning (RTX 3050 Ti, Tesla T4, TPU v5e, etc.)
+    # Dynamic Hardware Profile Auto-Tuning (RTX 3050 Ti, Tesla T4, TPU v5e, TPU v3-8, etc.)
     hw = detect_hardware_profile(
         user_batch_size=args.batch_size,
         user_grad_accum=args.grad_accum,
@@ -594,7 +601,8 @@ def train():
     args.device = hw.device_str
     is_cuda_dev = hw.is_cuda
     is_tpu_dev = hw.is_tpu
-    hw.print_banner()
+    if is_master:
+        hw.print_banner()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
@@ -714,7 +722,7 @@ def train():
     dataset = StreamingDatasetMixture(
         tokenizer=tokenizer,
         seq_len=args.seq_len,
-        seed=42,
+        seed=getattr(args, "seed", 42) + rank,
         resume_state=dataset_resume_state,
         effective_batch_size=args.batch_size * args.grad_accum,
     )
@@ -731,16 +739,20 @@ def train():
     csv_log_path = os.path.join(args.log_dir, f"{session_full_id}.csv")
     hp_log_path = os.path.join(args.log_dir, f"{session_full_id}_hyperparameters.json")
 
-    csv_file = open(csv_log_path, "w", newline="", encoding="utf-8")
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow([
-        "step", "tokens_processed", "loss", "avg_loss", "ppl", "avg_ppl",
-        "lr_muon", "lr_adam", "critic_loss", "real_acc", "fake_acc", "adv_loss", "reward",
-        "lambda_adv", "tokens_per_sec", "ram_mb", "vram_mb", "elapsed_sec", "timestamp"
-    ])
-    csv_file.flush()
-
-    jsonl_file = open(jsonl_log_path, "w", encoding="utf-8")
+    if is_master:
+        csv_file = open(csv_log_path, "w", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            "step", "tokens_processed", "loss", "avg_loss", "ppl", "avg_ppl",
+            "lr_muon", "lr_adam", "critic_loss", "real_acc", "fake_acc", "adv_loss", "reward",
+            "lambda_adv", "tokens_per_sec", "ram_mb", "vram_mb", "elapsed_sec", "timestamp"
+        ])
+        csv_file.flush()
+        jsonl_file = open(jsonl_log_path, "w", encoding="utf-8")
+    else:
+        csv_file = None
+        csv_writer = None
+        jsonl_file = None
 
     CHINCHILLA_TARGET = 2_600_000_000  # 2.6B tokens for 130M dense backbone (20x scaling)
 
@@ -764,13 +776,14 @@ def train():
         "enable_critic": args.enable_critic,
         "adv_weight": args.adv_weight,
         "device": args.device,
-        "dtype": args.dtype,
+        "dtype": str(dtype),
         "chinchilla_target_tokens": CHINCHILLA_TARGET,
     }
 
     # Save human-readable hyperparameters to session logs
-    with open(hp_log_path, "w", encoding="utf-8") as f:
-        json.dump(current_hyperparameters, f, indent=2)
+    if is_master:
+        with open(hp_log_path, "w", encoding="utf-8") as f:
+            json.dump(current_hyperparameters, f, indent=2)
 
     def get_session_metadata(curr_step: int, curr_tokens: int):
         s_info = {
@@ -813,24 +826,25 @@ def train():
         return s_info, full_history
 
     # CLI Banner
-    print("\n" + "=" * 80)
-    print("  [>] TINYTRANSFORMER PRETRAINING (GOATED CLI)")
-    print("=" * 80)
-    print(f"* Total Parameters:  {breakdown['total_params']/1e6:.2f}M ({breakdown['unique_params']:,} unique, ~237.8M params)")
-    print(f"* Backbone Layers:   {cfg.num_layers} layers, hidden={cfg.hidden_dim}, heads={cfg.num_heads}, ffn_mult={cfg.ffn_mult} ({breakdown['backbone_params']/1e6:.2f}M params)")
-    print(f"* Engram Tables:     80M global (post-L16) + two 10M at L{cfg.engram_layers[0]}/L{cfg.engram_layers[1]} ({breakdown['engram_params']/1e6:.2f}M params)")
-    print(f"* Critic Model:      Auxiliary Transformer BS-Detector ({critic.num_parameters/1e6:.2f}M params)")
-    print(f"* Weights Footprint: {breakdown['bf16_weight_size_mb']:.1f} MB in BF16")
-    print(f"* Optimizers:        Keller Jordan Muon (2D internal) + AdamW (Embeds/Engram/Norms)")
-    print(f"* LR Schedule:       Warmup {args.lr_warmup_steps} st, Cosine to {args.lr_decay_steps:,} st (min {args.lr_min_ratio:.1f}x) | Base Muon: {args.lr_muon:.4f}, AdamW: {args.lr_adam:.6f}")
-    print(f"* Critic Schedule:   Start: {args.critic_start_tokens/1e6:.0f}M tokens, Ramp: {args.critic_ramp_tokens/1e6:.0f}M tokens, Subsample: {args.critic_accum_steps}/{args.grad_accum} batches ({args.critic_slice_len} tok slice), Freeze: <0.20")
-    mix_desc = ", ".join(f"{int(c['weight']*100)}% {c['name'].capitalize()}" for c in STREAM_CONFIGS)
-    print(f"* Mixture Ratio:     {mix_desc}")
-    print(f"* Device / Dtype:    {args.device.upper()} / {args.dtype}")
-    print(f"* Batch Config:      Micro-batch {args.batch_size} x Accum {args.grad_accum} (Effective: {args.batch_size * args.grad_accum * args.seq_len:,} tokens/step)")
-    print(f"* Chinchilla Target: 2.60 Billion tokens ({total_tokens_processed/1e6:.2f}M seen, {total_tokens_processed / CHINCHILLA_TARGET * 100:.3f}% reached)")
-    print(f"* Session Log:       {csv_log_path}")
-    print("=" * 80 + "\n")
+    if is_master:
+        print("\n" + "=" * 80)
+        print("  [>] TINYTRANSFORMER PRETRAINING (GOATED CLI)")
+        print("=" * 80)
+        print(f"* Total Parameters:  {breakdown['total_params']/1e6:.2f}M ({breakdown['unique_params']:,} unique, ~237.8M params)")
+        print(f"* Backbone Layers:   {cfg.num_layers} layers, hidden={cfg.hidden_dim}, heads={cfg.num_heads}, ffn_mult={cfg.ffn_mult} ({breakdown['backbone_params']/1e6:.2f}M params)")
+        print(f"* Engram Tables:     80M global (post-L16) + two 10M at L{cfg.engram_layers[0]}/L{cfg.engram_layers[1]} ({breakdown['engram_params']/1e6:.2f}M params)")
+        print(f"* Critic Model:      Auxiliary Transformer BS-Detector ({critic.num_parameters/1e6:.2f}M params)")
+        print(f"* Weights Footprint: {breakdown['bf16_weight_size_mb']:.1f} MB in BF16")
+        print(f"* Optimizers:        Keller Jordan Muon (2D internal) + AdamW (Embeds/Engram/Norms)")
+        print(f"* LR Schedule:       Warmup {args.lr_warmup_steps} st, Cosine to {args.lr_decay_steps:,} st (min {args.lr_min_ratio:.1f}x) | Base Muon: {args.lr_muon:.4f}, AdamW: {args.lr_adam:.6f}")
+        print(f"* Critic Schedule:   Start: {args.critic_start_tokens/1e6:.0f}M tokens, Ramp: {args.critic_ramp_tokens/1e6:.0f}M tokens, Subsample: {args.critic_accum_steps}/{args.grad_accum} batches ({args.critic_slice_len} tok slice), Freeze: <0.20")
+        mix_desc = ", ".join(f"{int(c['weight']*100)}% {c['name'].capitalize()}" for c in STREAM_CONFIGS)
+        print(f"* Mixture Ratio:     {mix_desc}")
+        print(f"* Device / Dtype:    {args.device.upper()} / {args.dtype} (Cores: {world_size})")
+        print(f"* Batch Config:      Micro-batch {args.batch_size} x Accum {args.grad_accum} x {world_size} Cores (Effective: {args.batch_size * args.grad_accum * args.seq_len * world_size:,} tokens/step)")
+        print(f"* Chinchilla Target: 2.60 Billion tokens ({total_tokens_processed/1e6:.2f}M seen, {total_tokens_processed / CHINCHILLA_TARGET * 100:.3f}% reached)")
+        print(f"* Session Log:       {csv_log_path}")
+        print("=" * 80 + "\n")
 
     step = start_step
     start_time = time.time()
@@ -948,7 +962,7 @@ def train():
             else:
                 bx = bx.to(target_device)
                 by = by.to(target_device)
-            step_tokens += bx.numel()
+            step_tokens += bx.numel() * world_size
 
             # 1. Generator Forward (Clean Next-Token Prediction under autocast)
             if is_cuda_dev:
@@ -1108,7 +1122,7 @@ def train():
             ema_ppl = math.exp(min(ema_loss, 20.0))
 
         # Telemetry & Logging
-        if step % args.log_interval == 0 or step == 1 or step == args.max_steps:
+        if is_master and (step % args.log_interval == 0 or step == 1 or step == args.max_steps):
             now = time.time()
             elapsed_interval = max(now - last_log_time, 1e-5)
             interval_tokens = total_tokens_processed - last_tokens_count
@@ -1119,7 +1133,7 @@ def train():
             sec_per_step = total_elapsed / max(steps_done, 1)
 
             # Milestones: 4:1 (520M tok) and 8:1 (1.0B tok) calculated dynamically from tokens_per_step
-            tokens_per_step = args.batch_size * args.grad_accum * args.seq_len
+            tokens_per_step = args.batch_size * args.grad_accum * args.seq_len * world_size
             target_4_1_steps = 520_000_000 // max(1, tokens_per_step)
             target_8_1_steps = 1_000_000_000 // max(1, tokens_per_step)
             eta_4_1 = max(0.0, sec_per_step * (target_4_1_steps - step))
@@ -1173,15 +1187,16 @@ def train():
             print(log_line)
 
             # Write to CSV
-            csv_writer.writerow([
-                step, total_tokens_processed, round(current_loss, 4), round(ema_loss, 4),
-                round(current_ppl, 2), round(ema_ppl, 2), round(curr_lr_muon, 6), round(curr_lr_adam, 8),
-                round(accum_loss_critic, 4), round(accum_real_acc, 3), round(accum_fake_acc, 3),
-                round(accum_loss_adv, 4), round(accum_reward, 3), round(lambda_adv, 3),
-                round(tok_per_sec, 1), round(ram_mb, 1), round(vram_mb, 1), round(total_elapsed, 1),
-                datetime.now().isoformat()
-            ])
-            csv_file.flush()
+            if csv_writer:
+                csv_writer.writerow([
+                    step, total_tokens_processed, round(current_loss, 4), round(ema_loss, 4),
+                    round(current_ppl, 2), round(ema_ppl, 2), round(curr_lr_muon, 6), round(curr_lr_adam, 8),
+                    round(accum_loss_critic, 4), round(accum_real_acc, 3), round(accum_fake_acc, 3),
+                    round(accum_loss_adv, 4), round(accum_reward, 3), round(lambda_adv, 3),
+                    round(tok_per_sec, 1), round(ram_mb, 1), round(vram_mb, 1), round(total_elapsed, 1),
+                    datetime.now().isoformat()
+                ])
+                csv_file.flush()
             recent_log_history.append({
                 "step": step,
                 "tokens_processed": total_tokens_processed,
@@ -1197,29 +1212,30 @@ def train():
             last_tokens_count = total_tokens_processed
 
             # Write to JSONL
-            json_record = {
-                "step": step,
-                "tokens_processed": total_tokens_processed,
-                "loss": current_loss,
-                "avg_loss": ema_loss,
-                "ppl": current_ppl,
-                "avg_ppl": ema_ppl,
-                "lr_multiplier": lr_multiplier,
-                "lr_muon": curr_lr_muon,
-                "lr_adam": curr_lr_adam,
-                "critic_loss": accum_loss_critic,
-                "real_acc": accum_real_acc,
-                "fake_acc": accum_fake_acc,
-                "adv_loss": accum_loss_adv,
-                "reward": accum_reward,
-                "lambda_adv": lambda_adv,
-                "tokens_per_sec": tok_per_sec,
-                "vram_mb": vram_mb,
-                "timestamp": datetime.now().isoformat(),
-            }
-            jsonl_file.write(json.dumps(json_record) + "\n")
-            jsonl_file.flush()
-        else:
+            if jsonl_file:
+                json_record = {
+                    "step": step,
+                    "tokens_processed": total_tokens_processed,
+                    "loss": current_loss,
+                    "avg_loss": ema_loss,
+                    "ppl": current_ppl,
+                    "avg_ppl": ema_ppl,
+                    "lr_multiplier": lr_multiplier,
+                    "lr_muon": curr_lr_muon,
+                    "lr_adam": curr_lr_adam,
+                    "critic_loss": accum_loss_critic,
+                    "real_acc": accum_real_acc,
+                    "fake_acc": accum_fake_acc,
+                    "adv_loss": accum_loss_adv,
+                    "reward": accum_reward,
+                    "lambda_adv": lambda_adv,
+                    "tokens_per_sec": tok_per_sec,
+                    "vram_mb": vram_mb,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                jsonl_file.write(json.dumps(json_record) + "\n")
+                jsonl_file.flush()
+        elif is_master:
             # Active in-place line: updates live figures on the SAME single line in interactive terminals
             # Non-TTY file logs strictly receive clean 10-step permanent blocks
             if sys.stdout.isatty():
@@ -1262,7 +1278,7 @@ def train():
 
         # Mini-Inference Generation Test
         infer_outputs = None
-        if step % args.infer_interval == 0:
+        if is_master and step % args.infer_interval == 0:
             infer_outputs = run_mini_inference(model, tokenizer, step, args.device, dtype=dtype)
             if VAL_SHARDS:
                 val = eval_fixed(model, VAL_SHARDS, args.device)
@@ -1273,17 +1289,18 @@ def train():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             # Log mini-inference to JSONL session
-            infer_record = {
-                "step": step,
-                "type": "mini_inference",
-                "generations": infer_outputs,
-                "timestamp": datetime.now().isoformat(),
-            }
-            jsonl_file.write(json.dumps(infer_record) + "\n")
-            jsonl_file.flush()
+            if jsonl_file:
+                infer_record = {
+                    "step": step,
+                    "type": "mini_inference",
+                    "generations": infer_outputs,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                jsonl_file.write(json.dumps(infer_record) + "\n")
+                jsonl_file.flush()
 
         # Checkpoint Saving
-        if step % args.save_interval == 0 or step == args.max_steps:
+        if is_master and (step % args.save_interval == 0 or step == args.max_steps):
             s_info, full_hist = get_session_metadata(step, total_tokens_processed)
             save_metrics = {
                 "ema_loss": ema_loss,
@@ -1320,7 +1337,7 @@ def train():
                 )
 
         # Check remote control flags for safe runtime interaction
-        if os.path.exists("stop.flag") or os.path.exists("save.flag"):
+        if is_master and (os.path.exists("stop.flag") or os.path.exists("save.flag")):
             s_info, full_hist = get_session_metadata(step, total_tokens_processed)
             save_metrics = {
                 "ema_loss": ema_loss,
@@ -1373,7 +1390,8 @@ def train():
                 optimizers["critic"] = create_critic_optimizer(critic, critic_lr=args.critic_lr)
             try: os.remove("critic.flag")
             except Exception: pass
-            print(f"[*] critic.flag detected! Activated Critic co-training dynamically at step {step}.")
+            if is_master:
+                print(f"[*] critic.flag detected! Activated Critic co-training dynamically at step {step}.")
 
         accum_loss_lm = 0.0
         accum_loss_critic = 0.0
@@ -1382,10 +1400,75 @@ def train():
         accum_real_acc = 0.0
         accum_fake_acc = 0.0
 
-    wait_for_async_save()
-    csv_file.close()
-    jsonl_file.close()
-    print("\n[OK] Pretraining completed successfully!")
+    if is_master:
+        wait_for_async_save()
+        if csv_file:
+            csv_file.close()
+        if jsonl_file:
+            jsonl_file.close()
+        print("\n[OK] Pretraining completed successfully!")
+
+
+def train():
+    parser = argparse.ArgumentParser(description="TinyTransformer Pretraining Script")
+    parser.add_argument("--batch-size", type=int, default=None, help="Per-device micro-batch size (auto-tuned if not set)")
+    parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (auto-tuned if not set)")
+    parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length in tokens")
+    parser.add_argument("--max-steps", type=int, default=100_000_000, help="Maximum pretraining steps")
+    parser.add_argument("--lr-muon", type=float, default=0.006, help="Learning rate for Muon optimizer (default: 0.006)")
+    parser.add_argument("--lr-adam", type=float, default=3e-4, help="Learning rate for AdamW optimizer")
+    parser.add_argument("--lr-warmup-steps", type=int, default=50, help="Linear warmup steps (default: 50 for smooth early learning)")
+    parser.add_argument("--lr-decay-steps", type=int, default=79_000, help="Cosine decay target steps matching 2.6B token Chinchilla target (79k steps at 32k tokens/step)")
+    parser.add_argument("--lr-min-ratio", type=float, default=0.1, help="Minimum learning rate ratio at the end of decay")
+    parser.add_argument("--grad-checkpoint", action="store_true", default=True, help="Enable activation checkpointing for maximum VRAM headroom")
+    parser.add_argument("--no-grad-checkpoint", action="store_false", dest="grad_checkpoint", help="Disable activation checkpointing")
+    parser.add_argument("--critic-lr", type=float, default=1e-4, help="Learning rate for Critic optimizer")
+    parser.add_argument("--critic-start-tokens", type=int, default=250_000_000, help="Cumulative token threshold before activating adversarial RL loss")
+    parser.add_argument("--critic-ramp-tokens", type=int, default=100_000_000, help="Token count over which alpha/beta convex blending ramps")
+    parser.add_argument("--critic-start-step", "--critic-warmup-steps", type=int, default=7_500, help="Legacy step threshold before activating adversarial RL loss")
+    parser.add_argument("--critic-loss-target", type=float, default=2.4, help="Loss target threshold below which critic co-training activates (default: 2.4)")
+    parser.add_argument("--adv-weight", type=float, default=0.3, help="Max adversarial loss weight for generator (default: 0.3)")
+    parser.add_argument("--enable-critic", action="store_true", help="Enable co-training of the auxiliary critic model")
+    parser.add_argument("--critic-slice-len", type=int, default=256, help="Sequence length slice for Critic Gumbel-Softmax evaluation to reduce VRAM (default: 256)")
+    parser.add_argument("--critic-accum-steps", type=int, default=2, help="Number of micro-batches per optimizer step to evaluate Critic on (default: 2)")
+    parser.add_argument("--save-interval", type=int, default=250, help="Checkpoint save interval")
+    parser.add_argument("--infer-interval", type=int, default=1250, help="Mini-inference interval (5x increased: 1250 steps)")
+    parser.add_argument("--archive-interval", type=int, default=2500, help="Checkpoint archive interval with .md and .json reports (default: 2500 steps)")
+    parser.add_argument("--log-interval", type=int, default=10, help="Console logging interval")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint_latest.pt")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoints directory")
+    parser.add_argument("--log-dir", type=str, default="logs", help="Session logs directory")
+    parser.add_argument("--device", type=str, default=None, help="Device to run on (cuda, xla, or cpu - auto-detected if None)")
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"],
+                        help="Compute dtype (auto selects bfloat16 on Ampere/Ada/Hopper or float16 on T4/V100 for maximum Tensor Core throughput)")
+    parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile for maximum kernel fusion speed")
+    parser.add_argument("--auto-profile", action="store_true", default=True, help="Auto-tune for RTX 3050 Ti, Tesla T4, or TPU v5e")
+    parser.add_argument("--cloud-sync", "--pull-cloud", action="store_true", help="Check and download latest checkpoint from cloud before resuming")
+    parser.add_argument("--hf-repo", type=str, default=None, help="Hugging Face repo ID for cloud checkpoint sync (e.g. username/repo)")
+    parser.add_argument("--drive-id", type=str, default=None, help="Google Drive file ID for checkpoint sync")
+    parser.add_argument("--drive-url", type=str, default=None, help="Google Drive share link to checkpoint_latest.pt")
+    parser.add_argument("--cloud-url", type=str, default=None, help="Direct HTTP/HTTPS checkpoint URL")
+    parser.add_argument("--seed", type=int, default=42, help="Base random seed for dataset sampling")
+    parser.add_argument("--tpu-cores", type=int, default=None, choices=[1, 8], help="Number of TPU cores (1 or 8 for Kaggle TPU v3-8)")
+    args = parser.parse_args()
+
+    # Check for TPU multi-core distributed launch
+    is_multi_proc = (
+        bool(os.environ.get("WORLD_SIZE") and int(os.environ.get("WORLD_SIZE", "1")) > 1)
+        or bool(os.environ.get("TPU_NUM_DEVICES") and int(os.environ.get("TPU_NUM_DEVICES", "1")) > 1)
+    )
+
+    is_kaggle_tpu = bool(os.environ.get("TPU_NAME")) or bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE"))
+    target_cores = args.tpu_cores or (8 if (is_kaggle_tpu and not is_multi_proc and XLA_AVAILABLE and xm is not None) else 1)
+
+    if target_cores == 8 and not is_multi_proc and XLA_AVAILABLE and xm is not None:
+        import torch_xla.distributed.xla_multiprocessing as xmp
+        print("\n" + "=" * 80)
+        print("  [>] SPAWNING 8-CORE DISTRIBUTED PRETRAINING ON KAGGLE TPU v3-8")
+        print("=" * 80 + "\n", flush=True)
+        xmp.spawn(_train_worker, args=(args,), nprocs=8, start_method="fork")
+    else:
+        _train_worker(0, args)
 
 
 if __name__ == "__main__":
