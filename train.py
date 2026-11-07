@@ -105,11 +105,14 @@ def format_time(seconds: float) -> str:
 
 def cast_model_dtypes(model: torch.nn.Module, is_cuda_dev: bool, dtype: torch.dtype):
     """
-    Maintains FP32 precision for RMSNorm weights, tied embeddings, and sparse Engram memory tables,
-    while 2D Transformer weights and linear projections (attention, SwiGLU FFN, Engram gating & projections)
-    run in BF16 or FP16 for maximum Tensor Core and TPU MXU throughput.
+    Precision management:
+    - On BF16 (Ampere/Ada/Hopper/TPU): 2D weights run in BF16 directly without GradScaler,
+      while RMSNorm, embeddings, and Engram tables remain in FP32.
+    - On FP16 (Turing/Tesla T4): Model weights remain in FP32 so that gradients are FP32
+      for PyTorch GradScaler compatibility. torch.amp.autocast('cuda', dtype=torch.float16)
+      automatically executes matrix multiplications on FP16 Tensor Cores.
     """
-    if is_cuda_dev and dtype in (torch.bfloat16, torch.float16):
+    if is_cuda_dev and dtype == torch.bfloat16:
         for name, p in model.named_parameters():
             is_fp32 = (
                 "norm" in name
@@ -121,7 +124,11 @@ def cast_model_dtypes(model: torch.nn.Module, is_cuda_dev: bool, dtype: torch.dt
             if is_fp32:
                 p.data = p.data.to(torch.float32)
             else:
-                p.data = p.data.to(dtype)
+                p.data = p.data.to(torch.bfloat16)
+    elif is_cuda_dev and dtype == torch.float16:
+        # PyTorch GradScaler strictly requires FP32 parameter weights and FP32 gradients.
+        # Autocast handles executing all GEMM / Attention ops in FP16 on Tensor Cores.
+        model.to(dtype=torch.float32)
     elif is_cuda_dev:
         model.to(dtype=dtype)
 
@@ -639,7 +646,9 @@ def _train_worker(rank: int, args):
     # Keep Critic on CPU unless enable_critic=True to save VRAM and avoid CUDA overhead
     critic_device = target_device if args.enable_critic else "cpu"
     critic = CriticModel(in_dim=cfg.hidden_dim, max_seq_len=args.seq_len).to(critic_device)
-    if is_cuda_dev or is_tpu_dev:
+    if is_cuda_dev and dtype == torch.float16:
+        critic = critic.to(dtype=torch.float32)
+    elif is_cuda_dev or is_tpu_dev:
         critic = critic.to(dtype=dtype)
 
     if args.grad_checkpoint:
@@ -1140,11 +1149,16 @@ def _train_worker(rank: int, args):
 
         total_tokens_processed += step_tokens
 
-        # Check for Phase Transition: Foundation -> Instruct + Foundation Annealing Mix
-        if current_phase == "foundation" and total_tokens_processed >= args.base_tokens:
+        # Check for Phase Transition: Foundation -> Instruct + Foundation Annealing Mix (token-based or time-based e.g. 10h)
+        time_elapsed_hours = (time.time() - start_time) / 3600.0
+        time_triggered = (args.base_hours is not None and time_elapsed_hours >= args.base_hours)
+        token_triggered = (total_tokens_processed >= args.base_tokens)
+
+        if current_phase == "foundation" and (token_triggered or time_triggered):
             current_phase = "instruct"
             dataset.set_phase("instruct", instruct_ratio=args.instruct_mix_ratio)
             current_hyperparameters["phase"] = "instruct"
+            trigger_reason = f"Elapsed Time ({time_elapsed_hours:.1f}h >= {args.base_hours}h)" if time_triggered else f"Tokens ({total_tokens_processed:,} >= {args.base_tokens:,})"
             if is_master:
                 wait_for_async_save()
                 s_info, full_hist = get_session_metadata(step, total_tokens_processed)
@@ -1173,6 +1187,7 @@ def _train_worker(rank: int, args):
                 )
                 print("\n" + "=" * 80)
                 print("  [★ MILESTONE] BASE FOUNDATION PRETRAINING COMPLETE!")
+                print(f"  * Trigger:          {trigger_reason}")
                 print(f"  * Tokens Processed: {total_tokens_processed:,} ({total_tokens_processed/1e6:.1f}M tokens)")
                 print(f"  * Base Checkpoint:  {args.checkpoint_dir}/checkpoint_base_latest.pt")
                 print(f"  * Transitioning to: Phase 2 ({args.instruct_mix_tokens/1e6:.0f}M Instruct + Foundation Annealing Mix)")
@@ -1361,9 +1376,9 @@ def _train_worker(rank: int, args):
                 except Exception:
                     pass
 
-        # Mini-Inference Generation Test
+        # Mini-Inference Generation Test (super rare on cloud or disabled via --no-infer)
         infer_outputs = None
-        if is_master and step % args.infer_interval == 0:
+        if is_master and not getattr(args, "no_infer", False) and args.infer_interval > 0 and (step % args.infer_interval == 0):
             infer_outputs = run_mini_inference(model, tokenizer, step, args.device, dtype=dtype)
             if VAL_SHARDS:
                 val = eval_fixed(model, VAL_SHARDS, args.device)
@@ -1547,7 +1562,8 @@ def train():
     parser.add_argument("--critic-slice-len", type=int, default=256, help="Sequence length slice for Critic Gumbel-Softmax evaluation to reduce VRAM (default: 256)")
     parser.add_argument("--critic-accum-steps", type=int, default=2, help="Number of micro-batches per optimizer step to evaluate Critic on (default: 2)")
     parser.add_argument("--save-interval", type=int, default=250, help="Checkpoint save interval")
-    parser.add_argument("--infer-interval", type=int, default=1250, help="Mini-inference interval (5x increased: 1250 steps)")
+    parser.add_argument("--infer-interval", type=int, default=25_000, help="Mini-inference interval (default: 25,000 steps - super rare on cloud)")
+    parser.add_argument("--no-infer", action="store_true", default=False, help="Disable mini-inference generation tests completely during pretraining")
     parser.add_argument("--archive-interval", type=int, default=2500, help="Checkpoint archive interval with .md and .json reports (default: 2500 steps)")
     parser.add_argument("--log-interval", type=int, default=10, help="Console logging interval")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint_latest.pt")
@@ -1566,6 +1582,7 @@ def train():
     parser.add_argument("--seed", type=int, default=42, help="Base random seed for dataset sampling")
     parser.add_argument("--single-checkpoint", action="store_true", default=False, help="Keep only one latest checkpoint (no checkpoint_prev.pt) to conserve cloud disk space")
     parser.add_argument("--base-tokens", type=int, default=2_400_000_000, help="Foundation pretraining token target before switching to instruct mix (default: 2.4B)")
+    parser.add_argument("--base-hours", type=float, default=None, help="Hours of raw foundation training before switching to instruction mix (e.g. 10.0)")
     parser.add_argument("--instruct-mix-tokens", type=int, default=200_000_000, help="Tokens for instruction + foundation annealing mix (default: 200M)")
     parser.add_argument("--instruct-mix-ratio", type=float, default=0.50, help="Proportion of instruction data during instruct-mix phase (default: 0.50)")
     parser.add_argument("--tpu-cores", type=int, default=None, choices=[1, 8], help="Number of TPU cores (1 or 8 for Kaggle TPU v3-8)")
