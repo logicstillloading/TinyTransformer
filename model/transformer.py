@@ -214,7 +214,11 @@ class TinyTransformer(nn.Module):
         nn.init.zeros_(self.global_engram.gating_proj.weight)
 
         # Re-tie lm_head with tok_embeddings AFTER _init_weights to preserve embedding std = 0.02
-        if config.tie_embeddings:
+        self.tie_weights()
+
+    def tie_weights(self):
+        """Guarantees token embeddings and LM head projection share exact same tensor."""
+        if getattr(self.config, "tie_embeddings", True):
             self.lm_head.weight = self.tok_embeddings.weight
 
     def enable_gradient_checkpointing(self):

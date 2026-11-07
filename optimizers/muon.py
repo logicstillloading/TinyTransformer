@@ -173,14 +173,25 @@ def create_dual_optimizers(
        - Non-decayed: memory_table, centroids, 1D RMSNorm scale parameters, gate scalar, biases (weight_decay = 0.0).
     3. Critic Optimizer (if critic is provided): AdamW for the auxiliary critic model.
     """
+    # Ensure weights are tied if configured
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
+
     muon_params = []
     adam_decay_params = []
     adam_nodecay_params = []
     adam_memory_params = []
+    seen_param_ids = set()
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
+
+        if id(p) in seen_param_ids:
+            continue
+        if "lm_head" in name and getattr(model, "config", None) and getattr(model.config, "tie_embeddings", True):
+            continue
+        seen_param_ids.add(id(p))
 
         # Strictly distinguish Engram gating (gating_proj or .gate) from Transformer FFN gate_proj
         is_adam_explicit = (

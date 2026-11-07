@@ -595,6 +595,7 @@ def train():
     # 2. Models
     cfg = TransformerConfig(vocab_size=vocab_size, max_seq_len=args.seq_len)
     model = TinyTransformer(cfg).to(target_device)
+    model.tie_weights()
     cast_model_dtypes(model, is_cuda_dev or is_tpu_dev, dtype)
 
     # Keep Critic on CPU unless enable_critic=True to save VRAM and avoid CUDA overhead
@@ -649,17 +650,27 @@ def train():
         missing, unexpected = model.load_state_dict(resumed_ckpt["model_state_dict"], strict=False)
         print(f"[resume] missing={missing} unexpected={unexpected}")
         assert not missing, "checkpoint doesn't match model"
+        model.tie_weights()
         cast_model_dtypes(model, is_cuda_dev or is_tpu_dev, dtype)
         critic.load_state_dict(resumed_ckpt["critic_state_dict"], strict=False)
         muon_sd = resumed_ckpt.get("opt_muon_state_dict") or resumed_ckpt.get("muon_state_dict")
         adam_sd = resumed_ckpt.get("opt_adam_state_dict") or resumed_ckpt.get("adam_state_dict")
         critic_sd = resumed_ckpt.get("opt_critic_state_dict")
         if muon_sd and "muon" in optimizers:
-            optimizers["muon"].load_state_dict(muon_sd)
+            try:
+                optimizers["muon"].load_state_dict(muon_sd)
+            except Exception as e:
+                print(f"[Optimizer Warning] Could not load Muon optimizer state ({e}). Resuming with fresh momentum.")
         if adam_sd and "adam" in optimizers:
-            optimizers["adam"].load_state_dict(adam_sd)
+            try:
+                optimizers["adam"].load_state_dict(adam_sd)
+            except Exception as e:
+                print(f"[Optimizer Warning] Could not load AdamW optimizer state ({e}). Resuming with fresh moments.")
         if critic_sd and "critic" in optimizers:
-            optimizers["critic"].load_state_dict(critic_sd)
+            try:
+                optimizers["critic"].load_state_dict(critic_sd)
+            except Exception as e:
+                print(f"[Optimizer Warning] Could not load Critic optimizer state ({e}). Resuming with fresh moments.")
 
         start_step = resumed_ckpt["step"]
         total_tokens_processed = resumed_ckpt.get("tokens_processed", 0)
