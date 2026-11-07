@@ -68,23 +68,54 @@ def detect_hardware_profile(
     """
     TARGET_STEP_TOKENS = 32_768  # 32 sequences of 1024 tokens
 
-    # 1. Check for Google Cloud TPU (v5e, v4, v3)
+    # 1. Check for Google Cloud TPU (v5e, v4, v3 - Native PyTorch or PyTorch/XLA)
     is_tpu_env = False
-    if XLA_AVAILABLE and xm is not None:
+    tpu_dev = None
+
+    # Check user explicit argument first
+    if user_device in ("tpu", "xla"):
+        is_tpu_env = True
+
+    # Check PyTorch 2.x native accelerator API
+    if not is_tpu_env and hasattr(torch, "accelerator"):
+        try:
+            if torch.accelerator.is_available() and torch.accelerator.current_accelerator() == "tpu":
+                is_tpu_env = True
+                tpu_dev = torch.device("tpu")
+        except Exception:
+            pass
+
+    # Check direct torch.device("tpu") probe
+    if not is_tpu_env:
+        try:
+            test_dev = torch.device("tpu")
+            _probe = torch.ones(1, device=test_dev)
+            is_tpu_env = True
+            tpu_dev = test_dev
+        except Exception:
+            pass
+
+    # Check PyTorch / XLA
+    if not is_tpu_env and XLA_AVAILABLE and xm is not None:
         try:
             hw_type = xm.xla_device_hw(xm.xla_device())
             if hw_type == "TPU" or bool(os.environ.get("TPU_NAME")) or bool(os.environ.get("COLAB_TPU_ADDR")):
                 is_tpu_env = True
+                tpu_dev = xm.xla_device()
         except Exception:
-            is_tpu_env = False
+            pass
 
     if is_tpu_env:
-        tpu_dev = xm.xla_device()
+        if tpu_dev is None:
+            if XLA_AVAILABLE and xm is not None:
+                tpu_dev = xm.xla_device()
+            else:
+                tpu_dev = torch.device("tpu")
         mb = user_batch_size if (user_batch_size and user_batch_size > 0) else 8
         ga = user_grad_accum if (user_grad_accum and user_grad_accum > 0) else max(1, TARGET_STEP_TOKENS // (mb * seq_len))
         dt = torch.bfloat16
         return HardwareProfile(
-            name="Google Cloud TPU (v5e / XLA)",
+            name="Google Cloud TPU (v5e Matrix Units)",
             hardware_category="tpu_v5e",
             device=tpu_dev,
             device_str=str(tpu_dev),
@@ -98,7 +129,7 @@ def detect_hardware_profile(
             is_tpu=True,
             is_cuda=False,
             vram_gb=16.0,
-            description="TPU v5e Matrix Multiplication Engine via PyTorch/XLA",
+            description="TPU v5e Matrix Multiplication Engine via Native PyTorch TPU / XLA",
         )
 
     # 2. Check for CUDA GPUs

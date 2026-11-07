@@ -25,7 +25,8 @@ def zeroth_power_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float =
     a, b, c = 3.4445, -4.7750, 2.0315
     orig_dtype = G.dtype
 
-    compute_dtype = torch.bfloat16 if (G.is_cuda and torch.cuda.is_bf16_supported()) else G.dtype
+    is_tpu = "tpu" in str(G.device.type).lower()
+    compute_dtype = torch.bfloat16 if ((G.is_cuda and torch.cuda.is_bf16_supported()) or is_tpu) else G.dtype
     norm = torch.linalg.vector_norm(G, dim=(-2, -1), keepdim=True, dtype=torch.float32) + eps
     X = (G.float() / norm).to(compute_dtype)
 
