@@ -58,20 +58,21 @@ cd TinyTransformer
 pip install -r requirements.txt
 ```
 
-### Pretraining Commands
-* **Auto-Optimized Pretraining (Colab / T4 / A100 / RTX)**:
+### Pretraining Commands (100% Dynamic Plug-and-Play)
+* **Plug-and-Play Pretraining (Auto-detects RTX 3050 Ti, Tesla T4, or TPU v5e)**:
   ```bash
-  python train.py --batch-size 4 --grad-accum 8 --dtype auto --resume
+  python train.py --resume
   ```
+  *The dynamic hardware profiler automatically configures micro-batch size, gradient accumulation, precision (BF16 / FP16 + Scaler / TPU XLA), and memory headroom.*
 
-* **Local Consumer GPU (RTX 3050 Ti Laptop / 4.3 GB VRAM)**:
+* **Resume Locally with Cloud Sync (Pulls latest checkpoint from Hugging Face / Google Drive)**:
   ```bash
-  python train.py --batch-size 1 --grad-accum 32 --dtype auto --resume
+  python train.py --resume --cloud-sync --hf-repo logicstillloading/TinyTransformer-checkpoints
   ```
 
 * **Phase 2 Pretraining with Auxiliary Adversarial Critic RL**:
   ```bash
-  python train.py --batch-size 4 --grad-accum 8 --enable-critic --critic-loss-target 2.7 --resume
+  python train.py --resume --enable-critic --critic-loss-target 2.7
   ```
 
 ---

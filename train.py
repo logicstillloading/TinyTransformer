@@ -43,9 +43,11 @@ import torch.nn.functional as F
 
 from model.transformer import TinyTransformer, TransformerConfig
 from model.critic import CriticModel, compute_critic_loss, compute_generator_adversarial_loss
+from model.hardware import detect_hardware_profile, HardwareProfile, XLA_AVAILABLE, xm
 from optimizers.muon import create_dual_optimizers, create_critic_optimizer
 from data.tokenizer import get_or_create_tokenizer, Tokenizer
 from data.dataset import StreamingDatasetMixture, STREAM_CONFIGS
+from data.cloud_sync import sync_cloud_checkpoint, load_cloud_config
 
 
 INFER_PROMPTS = [
@@ -495,8 +497,8 @@ def eval_fixed(model, shard_paths, device, n_windows=16, seq_len=1024):
 
 def train():
     parser = argparse.ArgumentParser(description="TinyTransformer Pretraining Script")
-    parser.add_argument("--batch-size", type=int, default=1, help="Per-device micro-batch size (default: 1)")
-    parser.add_argument("--grad-accum", type=int, default=32, help="Gradient accumulation steps (default: 32 for 32,768 tokens/step)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Per-device micro-batch size (auto-tuned if not set)")
+    parser.add_argument("--grad-accum", type=int, default=None, help="Gradient accumulation steps (auto-tuned if not set)")
     parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length in tokens")
     parser.add_argument("--max-steps", type=int, default=100_000_000, help="Maximum pretraining steps")
     parser.add_argument("--lr-muon", type=float, default=0.006, help="Learning rate for Muon optimizer (default: 0.006)")
@@ -522,10 +524,15 @@ def train():
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint_latest.pt")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoints directory")
     parser.add_argument("--log-dir", type=str, default="logs", help="Session logs directory")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default=None, help="Device to run on (cuda, xla, or cpu - auto-detected if None)")
     parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"],
                         help="Compute dtype (auto selects bfloat16 on Ampere/Ada/Hopper or float16 on T4/V100 for maximum Tensor Core throughput)")
     parser.add_argument("--compile", action="store_true", help="Compile model with torch.compile for maximum kernel fusion speed")
+    parser.add_argument("--auto-profile", action="store_true", default=True, help="Auto-tune for RTX 3050 Ti, Tesla T4, or TPU v5e")
+    parser.add_argument("--cloud-sync", "--pull-cloud", action="store_true", help="Check and download latest checkpoint from cloud before resuming")
+    parser.add_argument("--hf-repo", type=str, default=None, help="Hugging Face repo ID for cloud checkpoint sync (e.g. username/repo)")
+    parser.add_argument("--drive-id", type=str, default=None, help="Google Drive file ID for checkpoint sync")
+    parser.add_argument("--cloud-url", type=str, default=None, help="Direct HTTP/HTTPS checkpoint URL")
     args = parser.parse_args()
 
     # Hardware acceleration flags (Ampere Tensor Core TF32 & cuDNN auto-tuner)
@@ -534,8 +541,21 @@ def train():
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
-    # Auto-restore hyperparameters from checkpoint if resuming
+    # 0. Cloud Checkpoint Auto-Sync (Plug & Play resumption across PC & Cloud)
     latest_ckpt_path = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
+    if (args.resume and not os.path.exists(latest_ckpt_path)) or getattr(args, "cloud_sync", False):
+        print(f"[*] [CloudSync] Checking cloud for latest checkpoint ({latest_ckpt_path} missing or sync requested)...")
+        synced = sync_cloud_checkpoint(
+            checkpoint_dir=args.checkpoint_dir,
+            hf_repo=args.hf_repo,
+            drive_id=args.drive_id,
+            url=args.cloud_url,
+            force_pull=getattr(args, "cloud_sync", False)
+        )
+        if synced and os.path.exists(synced):
+            print(f"[+] [CloudSync] Ready to resume from: {synced}")
+
+    # Auto-restore hyperparameters from checkpoint if resuming
     resumed_ckpt = None
     if args.resume and os.path.exists(latest_ckpt_path):
         print(f"[*] Inspecting checkpoint for saved hyperparameters: {latest_ckpt_path}")
@@ -551,27 +571,22 @@ def train():
                     setattr(args, hp_key, hp_val)
                     print(f"    • {hp_key}: {hp_val}")
 
-    # Dtype auto-resolution
-    is_cuda_dev = "cuda" in str(args.device) and torch.cuda.is_available()
-    if args.dtype == "auto":
-        if is_cuda_dev:
-            if torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-            else:
-                # On Tesla T4, V100, Turing/Volta sm_75/sm_70, use hardware-accelerated FP16 Tensor Cores
-                dtype = torch.float16
-        else:
-            dtype = torch.float32
-    elif args.dtype == "bfloat16":
-        if is_cuda_dev and not torch.cuda.is_bf16_supported():
-            print("[*] Notice: bfloat16 not natively supported on this CUDA device. Using float16 for maximum Tensor Core throughput.")
-            dtype = torch.float16
-        else:
-            dtype = torch.bfloat16
-    elif args.dtype == "float16":
-        dtype = torch.float16
-    else:
-        dtype = torch.float32
+    # Dynamic Hardware Profile Auto-Tuning (RTX 3050 Ti, Tesla T4, TPU v5e, etc.)
+    hw = detect_hardware_profile(
+        user_batch_size=args.batch_size,
+        user_grad_accum=args.grad_accum,
+        user_dtype=args.dtype,
+        user_device=args.device,
+        seq_len=args.seq_len,
+    )
+    args.batch_size = hw.batch_size
+    args.grad_accum = hw.grad_accum
+    dtype = hw.dtype
+    target_device = hw.device
+    args.device = hw.device_str
+    is_cuda_dev = hw.is_cuda
+    is_tpu_dev = hw.is_tpu
+    hw.print_banner()
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
@@ -582,14 +597,13 @@ def train():
 
     # 2. Models
     cfg = TransformerConfig(vocab_size=vocab_size, max_seq_len=args.seq_len)
-    model = TinyTransformer(cfg).to(args.device)
-    is_cuda_dev = "cuda" in str(args.device)
-    cast_model_dtypes(model, is_cuda_dev, dtype)
+    model = TinyTransformer(cfg).to(target_device)
+    cast_model_dtypes(model, is_cuda_dev or is_tpu_dev, dtype)
 
     # Keep Critic on CPU unless enable_critic=True to save VRAM and avoid CUDA overhead
-    critic_device = args.device if args.enable_critic else "cpu"
+    critic_device = target_device if args.enable_critic else "cpu"
     critic = CriticModel(in_dim=cfg.hidden_dim, max_seq_len=args.seq_len).to(critic_device)
-    if "cuda" in str(critic_device):
+    if is_cuda_dev or is_tpu_dev:
         critic = critic.to(dtype=dtype)
 
     if args.grad_checkpoint:
@@ -906,17 +920,22 @@ def train():
                 by = torch.stack(batch_y_list)
 
             if is_cuda_dev:
-                bx = bx.pin_memory().to(args.device, non_blocking=True)
-                by = by.pin_memory().to(args.device, non_blocking=True)
+                bx = bx.pin_memory().to(target_device, non_blocking=True)
+                by = by.pin_memory().to(target_device, non_blocking=True)
             else:
-                bx = bx.to(args.device)
-                by = by.to(args.device)
+                bx = bx.to(target_device)
+                by = by.to(target_device)
             step_tokens += bx.numel()
 
             # 1. Generator Forward (Clean Next-Token Prediction under autocast)
-            autocast_device = "cuda" if "cuda" in str(args.device) else "cpu"
-            with torch.amp.autocast(autocast_device, dtype=dtype):
+            if is_cuda_dev:
+                with torch.amp.autocast("cuda", dtype=dtype):
+                    logits, _, _, aux_loss = model(bx, return_hidden=False)
+            elif is_tpu_dev:
                 logits, _, _, aux_loss = model(bx, return_hidden=False)
+            else:
+                with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+                    logits, _, _, aux_loss = model(bx, return_hidden=False)
 
             # Vectorized cross-entropy loss computation in FP32 precision to prevent precision loss & underflow
             loss_lm = F.cross_entropy(
@@ -1013,7 +1032,13 @@ def train():
                 scaler.update()
             continue
 
-        if scaler.is_enabled():
+        if is_tpu_dev and XLA_AVAILABLE and xm is not None:
+            xm.optimizer_step(optimizers["muon"])
+            xm.optimizer_step(optimizers["adam"])
+            if critic_active and accum_loss_critic >= 0.20:
+                xm.optimizer_step(optimizers["critic"])
+            xm.mark_step()
+        elif scaler.is_enabled():
             scaler.step(optimizers["muon"])
             scaler.step(optimizers["adam"])
             # Dynamic Critic freeze: only step critic optimizer if loss_critic >= 0.20
