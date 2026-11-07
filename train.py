@@ -47,7 +47,7 @@ from model.hardware import detect_hardware_profile, HardwareProfile, XLA_AVAILAB
 from optimizers.muon import create_dual_optimizers, create_critic_optimizer
 from data.tokenizer import get_or_create_tokenizer, Tokenizer
 from data.dataset import StreamingDatasetMixture, STREAM_CONFIGS
-from data.cloud_sync import sync_cloud_checkpoint, load_cloud_config
+from data.cloud_sync import sync_cloud_checkpoint, load_cloud_config, auto_sync_on_interrupt, verify_checkpoint_integrity
 
 
 INFER_PROMPTS = [
@@ -1292,6 +1292,15 @@ def train():
                 sync=True,
             )
             print(f"[*] Checkpoint explicitly saved via flag at step {step}.")
+            latest_saved_pt = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
+            is_valid, msg, cinfo = verify_checkpoint_integrity(latest_saved_pt)
+            if is_valid:
+                print(f"[+] [Anti-Corruption Guard] Checkpoint verified healthy at step {step} (0 NaNs, 0 Infs).")
+                if os.path.exists("stop.flag") or getattr(args, "auto_push_cloud", False):
+                    auto_sync_on_interrupt(args.checkpoint_dir, hf_repo=args.hf_repo)
+            else:
+                print(f"[!] [CRITICAL ALERT] Checkpoint failed integrity check: {msg}")
+
             if os.path.exists("save.flag"):
                 try: os.remove("save.flag")
                 except Exception: pass
