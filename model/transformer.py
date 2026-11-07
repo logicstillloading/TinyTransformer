@@ -483,6 +483,12 @@ class TinyTransformer(nn.Module):
                 # Forward single step with KV cache
                 logits, kv_caches, _, _ = self.forward(next_token, kv_caches=kv_caches, use_cache=True, all_input_ids=curr_ids)
                 next_token_logits = logits[:, -1, :].clone()
+                if "tpu" in str(device).lower() or "xla" in str(device).lower():
+                    try:
+                        import torch_xla.core.xla_model as xm
+                        xm.mark_step()
+                    except Exception:
+                        pass
 
         return curr_ids
 

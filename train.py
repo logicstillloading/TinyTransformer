@@ -418,8 +418,9 @@ def run_mini_inference(
     dtype: torch.dtype = torch.bfloat16,
 ) -> Dict[str, str]:
     """Fast non-blocking completions for standard benchmark prompts."""
+    is_tpu = "tpu" in str(device).lower() or "xla" in str(device).lower()
     if max_new_tokens is None:
-        max_new_tokens = 100 if step >= 1000 else 50
+        max_new_tokens = 35 if is_tpu else (100 if step >= 1000 else 50)
     model.eval()
     results = {}
     print("\n" + "=" * 70)
