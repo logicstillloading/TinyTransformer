@@ -525,7 +525,7 @@ def train():
     parser.add_argument("--critic-slice-len", type=int, default=256, help="Sequence length slice for Critic Gumbel-Softmax evaluation to reduce VRAM (default: 256)")
     parser.add_argument("--critic-accum-steps", type=int, default=2, help="Number of micro-batches per optimizer step to evaluate Critic on (default: 2)")
     parser.add_argument("--save-interval", type=int, default=250, help="Checkpoint save interval")
-    parser.add_argument("--infer-interval", type=int, default=250, help="Mini-inference interval")
+    parser.add_argument("--infer-interval", type=int, default=1250, help="Mini-inference interval (5x increased: 1250 steps)")
     parser.add_argument("--archive-interval", type=int, default=2500, help="Checkpoint archive interval with .md and .json reports (default: 2500 steps)")
     parser.add_argument("--log-interval", type=int, default=10, help="Console logging interval")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint_latest.pt")
@@ -1246,6 +1246,18 @@ def train():
                 pa.default_memory_pool().release_unused()
             except Exception:
                 pass
+
+        # Dynamic check for infer_interval override (5x increased by default)
+        for check_path in ["infer_interval.txt", os.path.join(args.checkpoint_dir, "infer_interval.txt")]:
+            if os.path.exists(check_path):
+                try:
+                    with open(check_path, "r") as f:
+                        val = int(f.read().strip())
+                        if val > 0 and val != args.infer_interval:
+                            args.infer_interval = val
+                            print(f"[*] Dynamically updated infer_interval to {args.infer_interval} steps.")
+                except Exception:
+                    pass
 
         # Mini-Inference Generation Test
         infer_outputs = None
