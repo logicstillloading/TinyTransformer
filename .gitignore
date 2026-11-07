@@ -1,0 +1,44 @@
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Checkpoints (Excluded from git due to 100MB GitHub limit and multi-GB checkpoint files)
+checkpoints/
+checkpoints_backup_pre_fixes/
+checkpoints_test*/
+*.pt
+*.pth
+*.bin
+
+# Data Shards (uint16 memmap binary shards)
+data/shards/
+*.memmap
+
+# Logs & Metrics (Session-specific logs)
+logs/
+*.csv
+*.jsonl
+
+# Dynamic Runtime Flags
+*.flag
+stop.flag
+save.flag
+critic.flag
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# IDE & OS Metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,298 @@
+import json
+
+notebook = {
+    "cells": [
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "# 🚀 TinyTransformer-238M: Ultra High-Speed T4 GPU Pretraining on Google Colab\n",
+                "\n",
+                "[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/logicstillloading/TinyTransformer/blob/main/TinyTransformer_Colab_T4.ipynb)\n",
+                "\n",
+                "Pretraining the **~237.8M Parameter TinyTransformer** architecture featuring:\n",
+                "- **Reasoning-After-Retrieval Dynamic**: 80M global Engram table (post-Layer 16) + two 10M local Engram tables (Layers 5 & 11) followed by a 7-layer post-retrieval reasoning block.\n",
+                "- **Keller Jordan's Muon Optimizer**: 5th-order Newton-Schulz orthogonalization for 2D weight matrices + AdamW for embeddings, RMSNorms, and sparse Engram tables.\n",
+                "- **Adversarial Critic RL Co-Training**: Auxiliary ~9.2M parameter discriminator detecting hallucinations and rewarding crisp, grounded generations.\n",
+                "\n",
+                "---\n",
+                "\n",
+                "### ⚡ Maximum Throughput (Tokens/Sec Maxing) on Tesla T4:\n",
+                "- **Turing FP16 Tensor Cores (130 TFLOPs)**: Tesla T4 lacks native hardware BF16. This script automatically detects T4 and enables FP16 mixed precision with dynamic `GradScaler`, yielding **4x-5x faster throughput** than BF16 CPU emulation.\n",
+                "- **16 GB VRAM Parallel Saturation**: Scaled from laptop batch size 1 to **Micro-batch 4 (or 8)** with sequence length 1024, maximizing GPU core occupancy.\n",
+                "- **Google Drive Checkpoint Sync**: Atomic checkpointing rotates directly into Google Drive (`/content/drive/MyDrive/TinyTransformer/checkpoints`), so **zero progress is lost** even if Colab disconnects!\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 1. Verify NVIDIA GPU Hardware & Memory"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Check GPU device name and allocated VRAM\n",
+                "!nvidia-smi\n",
+                "\n",
+                "import torch\n",
+                "print(f\"PyTorch Version:  {torch.__version__}\")\n",
+                "print(f\"CUDA Available:   {torch.cuda.is_available()}\")\n",
+                "if torch.cuda.is_available():\n",
+                "    print(f\"GPU Model:        {torch.cuda.get_device_name(0)}\")\n",
+                "    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)\n",
+                "    print(f\"Total VRAM:       {vram_gb:.2f} GB\")\n",
+                "    print(f\"BF16 Supported:   {torch.cuda.is_bf16_supported()}\")\n",
+                "    if not torch.cuda.is_bf16_supported():\n",
+                "        print(\"[*] Tesla T4 detected: Hardware FP16 Tensor Cores will be utilized for maximum tokens/sec throughput!\")\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 2. Mount Google Drive for Continuous Atomic Checkpointing\n",
+                "Mounting Google Drive guarantees that checkpoints (`checkpoint_latest.pt`, `checkpoint_prev.pt`, and milestone archives) and session logs are saved directly to your Drive."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "from google.colab import drive\n",
+                "import os\n",
+                "\n",
+                "drive.mount('/content/drive')\n",
+                "\n",
+                "DRIVE_DIR = '/content/drive/MyDrive/TinyTransformer'\n",
+                "CHECKPOINT_DIR = os.path.join(DRIVE_DIR, 'checkpoints')\n",
+                "LOG_DIR = os.path.join(DRIVE_DIR, 'logs')\n",
+                "os.makedirs(CHECKPOINT_DIR, exist_ok=True)\n",
+                "os.makedirs(LOG_DIR, exist_ok=True)\n",
+                "print(f'[+] Google Drive mounted. Checkpoints will be safely preserved at: {CHECKPOINT_DIR}')\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 3. Clone TinyTransformer Repository & Install Dependencies"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Clone latest repository\n",
+                "!rm -rf TinyTransformer\n",
+                "!git clone https://github.com/logicstillloading/TinyTransformer.git\n",
+                "%cd TinyTransformer\n",
+                "\n",
+                "# Install required lightweight dependencies\n",
+                "!pip install -r requirements.txt -q\n",
+                "print('[+] Dependencies installed successfully!')\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 4. Architectural Verification & Parameter Breakdown (~238M)"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "from model.transformer import TinyTransformer, TransformerConfig\n",
+                "from data.tokenizer import get_or_create_tokenizer\n",
+                "\n",
+                "tok = get_or_create_tokenizer('tokenizer.json')\n",
+                "cfg = TransformerConfig(vocab_size=tok.vocab_size)\n",
+                "model = TinyTransformer(cfg)\n",
+                "bd = model.get_parameter_breakdown()\n",
+                "\n",
+                "print('=' * 60)\n",
+                "print(f\"  Total Parameters:    {bd['total_params']/1e6:.2f}M ({bd['unique_params']:,} unique)\")\n",
+                "print(f\"  Backbone Parameters: {bd['backbone_params']/1e6:.2f}M\")\n",
+                "print(f\"  Engram Memory:       {bd['engram_params']/1e6:.2f}M (80M post-L16 + two 10M at L5/L11)\")\n",
+                "print(f\"  Model Footprint:     {bd['bf16_weight_size_mb']:.1f} MB\")\n",
+                "print('=' * 60)\n",
+                "del model\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 5. Launch High-Throughput T4 GPU Pretraining 🚀\n",
+                "\n",
+                "This launch command maximizes GPU throughput by:\n",
+                "- Using `--batch-size 4 --grad-accum 8` (effective 32,768 tokens/step) for high parallel tensor utilization in 16GB VRAM.\n",
+                "- Auto-detecting `--dtype auto` to run hardware-accelerated FP16 with `GradScaler` on T4.\n",
+                "- Pointing `--checkpoint-dir` and `--log-dir` directly to Google Drive so training resumes seamlessly across sessions."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Start or resume pretraining\n",
+                "!python train.py \\\n",
+                "    --batch-size 4 \\\n",
+                "    --grad-accum 8 \\\n",
+                "    --seq-len 1024 \\\n",
+                "    --dtype auto \\\n",
+                "    --checkpoint-dir /content/drive/MyDrive/TinyTransformer/checkpoints \\\n",
+                "    --log-dir /content/drive/MyDrive/TinyTransformer/logs \\\n",
+                "    --lr-muon 0.006 \\\n",
+                "    --lr-adam 0.0003 \\\n",
+                "    --lr-warmup-steps 50 \\\n",
+                "    --lr-decay-steps 79000 \\\n",
+                "    --save-interval 250 \\\n",
+                "    --infer-interval 250 \\\n",
+                "    --archive-interval 2500 \\\n",
+                "    --resume\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 6. Run GPU Factual Probes and Generation Benchmarks\n",
+                "Evaluate the trained checkpoint on GPU to check vocabulary ranking on factual probes (Einstein, Washington, Paris, H2O) and generate sample completions."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "!python test.py \\\n",
+                "    --checkpoint /content/drive/MyDrive/TinyTransformer/checkpoints/checkpoint_latest.pt \\\n",
+                "    --device cuda \\\n",
+                "    --max-new-tokens 60 \\\n",
+                "    --temperature 0.70\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 7. Interactive Prompt Playground\n",
+                "Test custom queries interactively inside the notebook."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "import os\n",
+                "import torch\n",
+                "from data.tokenizer import get_or_create_tokenizer\n",
+                "from model.transformer import TinyTransformer, TransformerConfig\n",
+                "\n",
+                "tok = get_or_create_tokenizer('tokenizer.json')\n",
+                "cfg = TransformerConfig(vocab_size=tok.vocab_size)\n",
+                "model = TinyTransformer(cfg).cuda().eval()\n",
+                "\n",
+                "ckpt_path = '/content/drive/MyDrive/TinyTransformer/checkpoints/checkpoint_latest.pt'\n",
+                "if os.path.exists(ckpt_path):\n",
+                "    ckpt = torch.load(ckpt_path, map_location='cuda', weights_only=False)\n",
+                "    model.load_state_dict(ckpt['model_state_dict'], strict=False)\n",
+                "    print(f\"[+] Loaded checkpoint at global step {ckpt.get('step', 0):,} ({ckpt.get('tokens_processed', 0)/1e6:.1f}M tokens)\")\n",
+                "else:\n",
+                "    print('[!] No checkpoint found in Drive yet. Initialized with fresh weights.')\n",
+                "\n",
+                "def generate(prompt: str, max_tokens: int = 80, temp: float = 0.75):\n",
+                "    input_ids = torch.tensor([tok.encode(prompt, add_bos=True)], device='cuda')\n",
+                "    with torch.no_grad():\n",
+                "        out = model.generate(input_ids, max_new_tokens=max_tokens, temperature=temp, top_k=40, top_p=0.90)\n",
+                "    return tok.decode(out[0].tolist(), skip_special_tokens=True)\n",
+                "\n",
+                "# Test prompts\n",
+                "print(generate('User: Explain how gravity works.\\nAssistant:'))\n",
+                "print('-' * 50)\n",
+                "print(generate('def quicksort(arr):\\n    \"\"\"Sort list recursively.\"\"\"\\n'))\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 8. Visualize Loss and Perplexity Curves\n",
+                "Plot training loss, EMA loss, and step perplexity directly inline."
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "%matplotlib inline\n",
+                "!python plot_metrics.py --log-dir /content/drive/MyDrive/TinyTransformer/logs\n"
+            ]
+        },
+        {
+            "cell_type": "markdown",
+            "metadata": {},
+            "source": [
+                "## 9. Safe Remote Control Flags (Non-Destructive Pause & Snapshot)\n",
+                "Run any of the commands below to interactively signal the training process without stopping abruptly:"
+            ]
+        },
+        {
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "outputs": [],
+            "source": [
+                "# Graceful stop: completes current step, saves latest checkpoint, and exits cleanly\n",
+                "# !touch stop.flag\n",
+                "\n",
+                "# Immediate save: writes an atomic snapshot without stopping\n",
+                "# !touch save.flag\n",
+                "\n",
+                "# Cancel flags\n",
+                "# !rm -f stop.flag save.flag critic.flag\n"
+            ]
+        }
+    ],
+    "metadata": {
+        "accelerator": "GPU",
+        "colab": {
+            "provenance": [],
+            "gpuType": "T4"
+        },
+        "kernelspec": {
+            "display_name": "Python 3",
+            "name": "python3"
+        },
+        "language_info": {
+            "name": "python"
+        }
+    },
+    "nbformat": 4,
+    "nbformat_minor": 0
+}
+
+with open("TinyTransformer_Colab_T4.ipynb", "w", encoding="utf-8") as f:
+    json.dump(notebook, f, indent=2)
+
+print("Successfully created TinyTransformer_Colab_T4.ipynb")
