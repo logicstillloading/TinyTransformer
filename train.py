@@ -152,12 +152,18 @@ def _async_save_worker(state: Dict[str, Any], checkpoint_dir: str):
         f.flush()
         os.fsync(f.fileno())
 
-    # 3. Rotate existing latest checkpoint to prev
+    # 3. Rotate existing latest checkpoint to prev (or keep single if requested)
+    single_ckpt = state.get("single_checkpoint", False)
     if os.path.exists(latest_path):
         try:
-            if os.path.exists(prev_path):
-                os.remove(prev_path)
-            os.replace(latest_path, prev_path)
+            if not single_ckpt:
+                if os.path.exists(prev_path):
+                    os.remove(prev_path)
+                os.replace(latest_path, prev_path)
+            else:
+                if os.path.exists(prev_path):
+                    os.remove(prev_path)
+                os.remove(latest_path)
         except Exception as e:
             print(f"[Checkpoint Warning] Error rotating previous checkpoint: {e}")
 
@@ -222,6 +228,7 @@ def save_atomic_checkpoint(
     session_info: Optional[Dict[str, Any]] = None,
     session_history: Optional[List[Dict[str, Any]]] = None,
     sync: bool = True,
+    single_checkpoint: bool = False,
 ):
     os.makedirs(checkpoint_dir, exist_ok=True)
     wait_for_async_save()
@@ -261,6 +268,7 @@ def save_atomic_checkpoint(
         "hyperparameters": hyperparameters or {},
         "session_info": session_info or {},
         "session_history": session_history or [],
+        "single_checkpoint": single_checkpoint,
         "system_metadata": {
             "torch_version": torch.__version__,
             "cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
@@ -1321,6 +1329,7 @@ def _train_worker(rank: int, args):
                 session_info=s_info,
                 session_history=full_hist,
                 sync=(step == args.max_steps),
+                single_checkpoint=getattr(args, "single_checkpoint", False),
             )
             print(f"[*] Checkpoint atomically saved at step {step} to {args.checkpoint_dir}/checkpoint_latest.pt")
 
@@ -1357,6 +1366,7 @@ def _train_worker(rank: int, args):
                 session_info=s_info,
                 session_history=full_hist,
                 sync=True,
+                single_checkpoint=getattr(args, "single_checkpoint", False),
             )
             print(f"[*] Checkpoint explicitly saved via flag at step {step}.")
             latest_saved_pt = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
@@ -1449,6 +1459,7 @@ def train():
     parser.add_argument("--drive-url", type=str, default=None, help="Google Drive share link to checkpoint_latest.pt")
     parser.add_argument("--cloud-url", type=str, default=None, help="Direct HTTP/HTTPS checkpoint URL")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed for dataset sampling")
+    parser.add_argument("--single-checkpoint", action="store_true", default=False, help="Keep only one latest checkpoint (no checkpoint_prev.pt) to conserve cloud disk space")
     parser.add_argument("--tpu-cores", type=int, default=None, choices=[1, 8], help="Number of TPU cores (1 or 8 for Kaggle TPU v3-8)")
     args = parser.parse_args()
 
