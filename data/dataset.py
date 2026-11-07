@@ -364,6 +364,25 @@ class StreamingDatasetMixture(IterableDataset):
 
         while len(buf) < self.seq_len + 1:
             it = self.iterators[stream_idx] if self.iterators is not None else None
+            if it is None and self.iterators is not None:
+                # Self-healing reconnection on network blips / bad file descriptors
+                try:
+                    cfg = STREAM_CONFIGS[stream_idx]
+                    from datasets import load_dataset
+                    skip_count = self.samples_consumed.get(name, 0)
+                    if cfg["config"] is not None:
+                        ds = load_dataset(cfg["ds"], cfg["config"], split="train", streaming=True)
+                    else:
+                        ds = load_dataset(cfg["ds"], split="train", streaming=True)
+                    if skip_count > 0:
+                        ds = ds.skip(skip_count)
+                    it = iter(ds)
+                    self.iterators[stream_idx] = it
+                    print(f"[Dataset] Successfully reconnected to '{name}' at sample offset {skip_count:,}.")
+                except Exception as e:
+                    time.sleep(1.0)
+                    it = None
+
             text = None
             if it is not None:
                 try:
@@ -394,13 +413,15 @@ class StreamingDatasetMixture(IterableDataset):
                         self.iterators[stream_idx] = None
                         text = None
                 except Exception as e:
-                    print(f"[Dataset Warning] '{name}' read error: {e}")
+                    print(f"[Dataset Warning] '{name}' network/read blip: {e}. Retrying connection...")
+                    self.iterators[stream_idx] = None
+                    time.sleep(1.0)
                     text = None
 
             if not text or len(text.strip()) < 10:
                 self._fails = getattr(self, "_fails", 0) + 1
-                if it is None or self._fails > 100:
-                    raise RuntimeError(f"[Dataset] '{name}': no shards and stream unavailable. Refusing synthetic fallback.")
+                if self._fails > 200:
+                    raise RuntimeError(f"[Dataset] '{name}': no shards and stream unavailable after 200 retries.")
                 continue
             self._fails = 0
 
