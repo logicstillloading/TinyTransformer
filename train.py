@@ -95,23 +95,18 @@ def format_time(seconds: float) -> str:
 
 def cast_model_dtypes(model: torch.nn.Module, is_cuda_dev: bool, dtype: torch.dtype):
     """
-    Maintains FP32 precision for 1D params, embeddings, and sparse Engram memory tables,
-    while 2D Transformer weights (attention projections, SwiGLU FFN) run in BF16 or FP16.
-    Ensures SwiGLU FFN gate_proj is NOT misclassified as an Engram gate!
+    Maintains FP32 precision for RMSNorm weights, tied embeddings, and sparse Engram memory tables,
+    while 2D Transformer weights and linear projections (attention, SwiGLU FFN, Engram gating & projections)
+    run in BF16 or FP16 for maximum Tensor Core and TPU MXU throughput.
     """
     if is_cuda_dev and dtype in (torch.bfloat16, torch.float16):
         for name, p in model.named_parameters():
             is_fp32 = (
                 "norm" in name
-                or name.endswith(".gate")
-                or ("engram" in name and "gate" in name)
-                or "gating_proj" in name
-                or "bias" in name
                 or "tok_embeddings" in name
                 or "lm_head" in name
                 or "memory_table" in name
                 or "centroids" in name
-                or p.ndim < 2
             )
             if is_fp32:
                 p.data = p.data.to(torch.float32)
@@ -133,6 +128,7 @@ def _state_to_cpu(obj):
 
 
 def _async_save_worker(state: Dict[str, Any], checkpoint_dir: str):
+    os.makedirs(checkpoint_dir, exist_ok=True)
     latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
     prev_path = os.path.join(checkpoint_dir, "checkpoint_prev.pt")
     tmp_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt.tmp")

@@ -139,7 +139,9 @@ class NGramHashEngramTable(nn.Module):
         # Dynamic context-aware sigmoid gating with active floor:
         # gate = 0.10 + 0.90 * sigmoid(gating_proj(x_norm))
         x_norm = self.norm(x)
-        gate_raw = torch.sigmoid(self.gating_proj(x_norm))
+        gate_w_dtype = self.gating_proj.weight.dtype
+        gate_in = x_norm.to(gate_w_dtype) if x_norm.dtype != gate_w_dtype else x_norm
+        gate_raw = torch.sigmoid(self.gating_proj(gate_in))
         gate = 0.10 + 0.90 * gate_raw
 
         output_tensor = x + (gate.to(x.dtype) * out.to(x.dtype))
