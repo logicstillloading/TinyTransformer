@@ -12,12 +12,20 @@ from tokenizers.pre_tokenizers import ByteLevel
 from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 
 
-SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"]
+TOOL_AND_AGENT_SPECIAL_TOKENS = [
+    "<tool_call>", "</tool_call>",
+    "<tool_response>", "</tool_response>",
+    "<thought>", "</thought>",
+    "<system>", "</system>",
+    "<user>", "</user>",
+    "<assistant>", "</assistant>",
+]
+SPECIAL_TOKENS = ["<pad>", "<bos>", "<eos>", "<unk>"] + TOOL_AND_AGENT_SPECIAL_TOKENS
 PAD_ID = 0
 BOS_ID = 1
 EOS_ID = 2
 UNK_ID = 3
-DEFAULT_VOCAB_SIZE = 16384
+DEFAULT_VOCAB_SIZE = 16396
 
 
 class Tokenizer:
@@ -55,6 +63,10 @@ class Tokenizer:
     @classmethod
     def from_file(cls, path: str) -> "Tokenizer":
         hf_tok = HFTokenizer.from_file(path)
+        existing = hf_tok.get_vocab()
+        missing = [t for t in TOOL_AND_AGENT_SPECIAL_TOKENS if t not in existing]
+        if missing:
+            hf_tok.add_special_tokens(missing)
         return cls(hf_tok)
 
 

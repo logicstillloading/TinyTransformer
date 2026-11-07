@@ -17,8 +17,10 @@ Key Features:
 from collections import deque
 import gc
 import glob
+import json
 import os
 import random
+import time
 from typing import Dict, List, Optional, Tuple, Iterator, Any
 import numpy as np
 import torch
@@ -27,13 +29,74 @@ from torch.utils.data import IterableDataset
 from .tokenizer import Tokenizer
 
 
+# Multi-faceted instruction mixture covering tool calling, coding, reasoning, and dialogue
+INSTRUCTION_SUBSETS = [
+    {"name": "tools", "ds": "HuggingFaceTB/smoltalk", "config": "apigen-80k", "weight": 0.25},
+    {"name": "coding", "ds": "HuggingFaceTB/smoltalk", "config": "self-oss-instruct", "weight": 0.20},
+    {"name": "reasoning", "ds": "HuggingFaceTB/smoltalk", "config": "numina-cot-100k", "weight": 0.20},
+    {"name": "talking", "ds": "HuggingFaceTB/smoltalk", "config": "everyday-conversations", "weight": 0.15},
+    {"name": "magpie", "ds": "HuggingFaceTB/smoltalk", "config": "smol-magpie-ultra", "weight": 0.10},
+    {"name": "openhermes", "ds": "HuggingFaceTB/smoltalk", "config": "openhermes-100k", "weight": 0.10},
+]
+
+
+def format_instruction_item(item: Dict[str, Any]) -> str:
+    """
+    Formats multi-turn instruction, agentic coding, tool-calling, and distilled reasoning conversations
+    using XML-style special tokens (<system>, <user>, <thought>, <tool_call>, <tool_response>, <assistant>).
+    """
+    if "messages" in item and item["messages"]:
+        parts = []
+        for msg in item["messages"]:
+            role = (msg.get("role") or "user").lower()
+            content = msg.get("content") or ""
+            tool_calls = msg.get("tool_calls")
+            thought = msg.get("thought")
+
+            if role == "system":
+                parts.append(f"<system>{content}</system>")
+            elif role in ("user", "human"):
+                parts.append(f"<user>{content}</user>")
+            elif role in ("tool", "tool_response"):
+                parts.append(f"<tool_response>{content}</tool_response>")
+            elif role in ("assistant", "gpt", "model"):
+                seg = ""
+                if thought:
+                    seg += f"<thought>{thought}</thought>\n"
+                if tool_calls:
+                    for tc in tool_calls:
+                        func = tc.get("function") if isinstance(tc, dict) else None
+                        if func:
+                            call_dict = {"name": func.get("name"), "arguments": func.get("arguments")}
+                            seg += f"<tool_call>{json.dumps(call_dict)}</tool_call>\n"
+                        elif isinstance(tc, str):
+                            seg += f"<tool_call>{tc}</tool_call>\n"
+                if content:
+                    seg += f"<assistant>{content}</assistant>"
+                if seg:
+                    parts.append(seg.strip())
+            else:
+                parts.append(f"<{role}>{content}</{role}>")
+        return "\n".join(parts)
+    elif "prompt" in item and ("response" in item or "completion" in item):
+        resp = item.get("response") or item.get("completion") or ""
+        return f"<user>{item['prompt']}</user>\n<assistant>{resp}</assistant>"
+    elif "instruction" in item and "output" in item:
+        inp = item.get("input", "")
+        q = f"{item['instruction']}\n{inp}".strip() if inp else item['instruction']
+        return f"<user>{q}</user>\n<assistant>{item['output']}</assistant>"
+    elif "text" in item:
+        return item["text"]
+    return ""
+
+
 STREAM_CONFIGS = [
     {"name": "cosmopedia", "ds": "HuggingFaceTB/smollm-corpus", "config": "cosmopedia-v2", "weight": 0.28},
     {"name": "fineweb", "ds": "HuggingFaceTB/smollm-corpus", "config": "fineweb-edu-dedup", "weight": 0.28},
     {"name": "finemath", "ds": "HuggingFaceTB/finemath", "config": "finemath-4plus", "weight": 0.15},
     {"name": "python", "ds": "Avelina/python-edu-cleaned", "config": None, "weight": 0.12},
     {"name": "wikipedia", "ds": "wikimedia/wikipedia", "config": "20231101.en", "weight": 0.10},
-    {"name": "instruction", "ds": "HuggingFaceTB/smol-smoltalk", "config": None, "weight": 0.07},
+    {"name": "instruction", "ds": "HuggingFaceTB/smoltalk", "config": "apigen-80k", "weight": 0.07},
 ]
 
 
@@ -387,8 +450,8 @@ class StreamingDatasetMixture(IterableDataset):
             if it is not None:
                 try:
                     item = next(it)
-                    if "messages" in item:
-                        text = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in item["messages"]])
+                    if "messages" in item or "instruction" in item or "prompt" in item:
+                        text = format_instruction_item(item)
                     else:
                         text = item.get("text", "")
                     self.samples_consumed[name] += 1
@@ -403,8 +466,8 @@ class StreamingDatasetMixture(IterableDataset):
                         it = iter(ds)
                         self.iterators[stream_idx] = it
                         item = next(it)
-                        if "messages" in item:
-                            text = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in item["messages"]])
+                        if "messages" in item or "instruction" in item or "prompt" in item:
+                            text = format_instruction_item(item)
                         else:
                             text = item.get("text", "")
                         self.samples_consumed[name] += 1

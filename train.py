@@ -694,6 +694,21 @@ def _train_worker(rank: int, args):
     dataset_resume_state = None
 
     if resumed_ckpt is not None:
+        # Seamless vocabulary adaptation (e.g. 16,384 -> 16,396 with special tool/agent tokens)
+        ckpt_sd = resumed_ckpt["model_state_dict"]
+        if "tok_embeddings.weight" in ckpt_sd:
+            ckpt_v = ckpt_sd["tok_embeddings.weight"].shape[0]
+            model_v = model.tok_embeddings.weight.shape[0]
+            if ckpt_v != model_v:
+                print(f"[*] Adapting checkpoint embedding matrix for expanded vocabulary ({ckpt_v} -> {model_v})...")
+                new_emb = model.tok_embeddings.weight.detach().clone()
+                new_emb[:min(ckpt_v, model_v)] = ckpt_sd["tok_embeddings.weight"][:min(ckpt_v, model_v)]
+                ckpt_sd["tok_embeddings.weight"] = new_emb
+                if "lm_head.weight" in ckpt_sd and model.lm_head is not None:
+                    new_lm = model.lm_head.weight.detach().clone()
+                    new_lm[:min(ckpt_v, model_v)] = ckpt_sd["lm_head.weight"][:min(ckpt_v, model_v)]
+                    ckpt_sd["lm_head.weight"] = new_lm
+
         missing, unexpected = model.load_state_dict(resumed_ckpt["model_state_dict"], strict=False)
         print(f"[resume] missing={missing} unexpected={unexpected}")
         assert not missing, "checkpoint doesn't match model"

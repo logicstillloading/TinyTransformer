@@ -26,7 +26,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data.tokenizer import Tokenizer, get_or_create_tokenizer
-from data.dataset import STREAM_CONFIGS
+from data.dataset import STREAM_CONFIGS, INSTRUCTION_SUBSETS, format_instruction_item
 
 CJK_REGEX = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u0400-\u04ff]')
 
@@ -123,8 +123,8 @@ def download_and_tokenize_stream(
         try:
             sample = next(it)
             docs_seen += 1
-            if "messages" in sample:
-                text = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in sample["messages"]])
+            if "messages" in sample or "instruction" in sample or "prompt" in sample:
+                text = format_instruction_item(sample)
             else:
                 text = sample.get("text", "")
         except StopIteration:
@@ -136,8 +136,8 @@ def download_and_tokenize_stream(
             it = iter(ds)
             sample = next(it)
             docs_seen += 1
-            if "messages" in sample:
-                text = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in sample["messages"]])
+            if "messages" in sample or "instruction" in sample or "prompt" in sample:
+                text = format_instruction_item(sample)
             else:
                 text = sample.get("text", "")
         except Exception as e:
@@ -260,13 +260,31 @@ def download_and_tokenize(
         if stream_filter and cfg["name"] != stream_filter:
             continue
         stream_target = target_tokens if (stream_filter or len(normalized_configs) == 1) else int(target_tokens * cfg["weight"])
-        download_and_tokenize_stream(
-            cfg=cfg,
-            target_tokens=stream_target,
-            shard_size=shard_size,
-            shard_dir=shard_dir,
-            tokenizer=tokenizer,
-        )
+        if cfg["name"] == "instruction":
+            print(f"\n[+] Processing Multi-Faceted Instruction Mixture across {len(INSTRUCTION_SUBSETS)} specialized domains...")
+            for sub in INSTRUCTION_SUBSETS:
+                sub_target = max(200_000, int(stream_target * sub["weight"]))
+                sub_cfg = {
+                    "name": f"instruction_{sub['name']}",
+                    "ds": sub["ds"],
+                    "config": sub["config"],
+                    "weight": sub["weight"],
+                }
+                download_and_tokenize_stream(
+                    cfg=sub_cfg,
+                    target_tokens=sub_target,
+                    shard_size=shard_size,
+                    shard_dir=shard_dir,
+                    tokenizer=tokenizer,
+                )
+        else:
+            download_and_tokenize_stream(
+                cfg=cfg,
+                target_tokens=stream_target,
+                shard_size=shard_size,
+                shard_dir=shard_dir,
+                tokenizer=tokenizer,
+            )
 
     final_stats = get_shard_stats(shard_dir)
     print("\n" + "=" * 70)
