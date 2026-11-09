@@ -91,12 +91,13 @@ def format_instruction_item(item: Dict[str, Any]) -> str:
 
 
 STREAM_CONFIGS = [
-    {"name": "cosmopedia", "ds": "HuggingFaceTB/smollm-corpus", "config": "cosmopedia-v2", "weight": 0.28},
-    {"name": "fineweb", "ds": "HuggingFaceTB/smollm-corpus", "config": "fineweb-edu-dedup", "weight": 0.28},
-    {"name": "finemath", "ds": "HuggingFaceTB/finemath", "config": "finemath-4plus", "weight": 0.15},
+    {"name": "fineweb", "ds": "HuggingFaceTB/smollm-corpus", "config": "fineweb-edu-dedup", "weight": 0.30},
+    {"name": "cosmopedia", "ds": "HuggingFaceTB/smollm-corpus", "config": "cosmopedia-v2", "weight": 0.22},
+    {"name": "finemath", "ds": "HuggingFaceTB/finemath", "config": "finemath-3plus", "weight": 0.15},
     {"name": "python", "ds": "Avelina/python-edu-cleaned", "config": None, "weight": 0.12},
-    {"name": "wikipedia", "ds": "wikimedia/wikipedia", "config": "20231101.en", "weight": 0.10},
-    {"name": "instruction", "ds": "HuggingFaceTB/smoltalk", "config": "apigen-80k", "weight": 0.07},
+    {"name": "dclm", "ds": "HuggingFaceFW/dclm_100BT", "config": None, "weight": 0.11},
+    {"name": "wikipedia", "ds": "wikimedia/wikipedia", "config": "20231101.en", "weight": 0.08},
+    {"name": "instruction", "ds": "HuggingFaceTB/smoltalk", "config": "apigen-80k", "weight": 0.02},
 ]
 
 
@@ -318,12 +319,14 @@ class StreamingDatasetMixture(IterableDataset):
                 "Let G be a group. A subgroup H is normal if and only if g H g^{-1} = H for all g in G. This implies the quotient group G/H is well-defined.",
                 "Proof by induction: For the base case n=1, the equality 1 = 1(2)/2 holds. Assuming true for k, the summation simplifies to (k+1)(k+2)/2.",
             ]
-        elif stream_name == "fineweb":
+        elif stream_name in ("fineweb", "dclm"):
             topics = [
                 "Education systems around the world emphasize critical thinking, analytical reasoning, and interdisciplinary collaboration.",
                 "The history of literature reflects changing cultural norms, philosophical movements, and major historical developments.",
                 "Modern macroeconomics analyzes aggregate indicators such as GDP, inflation rates, and national income distribution.",
                 "Cognitive psychology examines internal mental processes including memory acquisition, linguistic cognition, and problem solving.",
+                "Technological revolutions in open distributed computing have accelerated software iteration cycles globally.",
+                "Environmental conservation initiatives focus on biodiversity preservation and renewable energy transitions.",
             ]
         elif stream_name == "instruction":
             topics = [

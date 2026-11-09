@@ -120,13 +120,23 @@ def detect_hardware_profile(
             else:
                 tpu_dev = torch.device("tpu")
 
+        # Check if environment or user specified TPU v5 / v5e
+        is_v5e = (
+            "v5" in os.environ.get("TPU_ACCELERATOR_TYPE", "").lower()
+            or "v5" in os.environ.get("TPU_NAME", "").lower()
+            or "v5" in os.environ.get("ACCELERATOR_TYPE", "").lower()
+            or (user_device and "v5" in str(user_device).lower())
+            or os.environ.get("TPU_VERSION") == "v5e"
+        )
+        tpu_gen = "v5e-8" if is_v5e else "v3-8"
+
         if is_multi_core:
             mb = user_batch_size if (user_batch_size and user_batch_size > 0) else 4
             ga = user_grad_accum if (user_grad_accum and user_grad_accum > 0) else max(1, TARGET_STEP_TOKENS // (mb * max(1, num_cores) * seq_len))
             dt = torch.bfloat16
             return HardwareProfile(
-                name=f"Kaggle / Cloud TPU v3-8 ({num_cores} Cores Distributed)",
-                hardware_category="tpu_v3_8",
+                name=f"Kaggle / Cloud TPU {tpu_gen} ({num_cores} Cores Distributed)",
+                hardware_category=f"tpu_{tpu_gen.replace('-', '_')}",
                 device=tpu_dev,
                 device_str=str(tpu_dev),
                 dtype=dt,
@@ -139,7 +149,7 @@ def detect_hardware_profile(
                 is_tpu=True,
                 is_cuda=False,
                 vram_gb=16.0 * max(1, num_cores),
-                description=f"TPU v3-8 Cluster with {num_cores} Parallel Cores ({16.0 * max(1, num_cores):.0f} GB HBM) via PyTorch/XLA",
+                description=f"TPU {tpu_gen} Cluster with {num_cores} Parallel Cores ({16.0 * max(1, num_cores):.0f} GB HBM) via PyTorch/XLA",
             )
 
         mb = user_batch_size if (user_batch_size and user_batch_size > 0) else 8

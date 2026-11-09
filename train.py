@@ -767,6 +767,7 @@ def _train_worker(rank: int, args):
         seq_len=args.seq_len,
         seed=getattr(args, "seed", 42) + rank,
         resume_state=dataset_resume_state,
+        shard_dir=getattr(args, "shard_dir", "data/shards"),
         effective_batch_size=args.batch_size * args.grad_accum,
     )
     current_phase = getattr(dataset, "phase", "foundation")
@@ -928,7 +929,8 @@ def _train_worker(rank: int, args):
     current_loss = 0.0
     current_ppl = 0.0
 
-    VAL_SHARDS = {os.path.basename(p).split("_")[1]: p for p in sorted(glob.glob("data/shards/val_*.bin"))}
+    shard_dir_path = getattr(args, "shard_dir", "data/shards")
+    VAL_SHARDS = {os.path.basename(p).split("_")[1]: p for p in sorted(glob.glob(os.path.join(shard_dir_path, "val_*.bin")))}
 
     while step < args.max_steps:
         step += 1
@@ -1513,6 +1515,13 @@ def _train_worker(rank: int, args):
             if is_master:
                 print(f"[*] critic.flag detected! Activated Critic co-training dynamically at step {step}.")
 
+        # Check session time limit (e.g. for Kaggle 9h limit)
+        if getattr(args, "max_hours", None) is not None and time_elapsed_hours >= args.max_hours:
+            if is_master:
+                print(f"\n[!] Session execution time limit reached ({time_elapsed_hours:.2f}h >= {args.max_hours:.2f}h).")
+                print("[*] Initiating graceful shutdown and persisting final atomic checkpoint...")
+            break
+
         accum_loss_lm = 0.0
         accum_loss_critic = 0.0
         accum_loss_adv = 0.0
@@ -1600,7 +1609,9 @@ def train():
     parser.add_argument("--base-hours", type=float, default=None, help="Hours of raw foundation training before switching to instruction mix (e.g. 10.0)")
     parser.add_argument("--instruct-mix-tokens", type=int, default=200_000_000, help="Tokens for instruction + foundation annealing mix (default: 200M)")
     parser.add_argument("--instruct-mix-ratio", type=float, default=0.50, help="Proportion of instruction data during instruct-mix phase (default: 0.50)")
-    parser.add_argument("--tpu-cores", type=int, default=None, choices=[1, 8], help="Number of TPU cores (1 or 8 for Kaggle TPU v3-8)")
+    parser.add_argument("--tpu-cores", type=int, default=None, choices=[1, 8], help="Number of TPU cores (1 or 8 for Kaggle TPU v3-8 or v5e-8)")
+    parser.add_argument("--max-hours", type=float, default=None, help="Maximum execution time in hours before graceful shutdown (e.g. 8.4 for Kaggle 9h limit)")
+    parser.add_argument("--shard-dir", type=str, default="data/shards", help="Directory containing pre-tokenized NVMe binary shards")
     args = parser.parse_args()
 
     # Check for TPU multi-core distributed launch
@@ -1614,8 +1625,16 @@ def train():
 
     if target_cores == 8 and not is_multi_proc and XLA_AVAILABLE and xm is not None:
         import torch_xla.distributed.xla_multiprocessing as xmp
+        is_v5 = (
+            "v5" in os.environ.get("TPU_ACCELERATOR_TYPE", "").lower()
+            or "v5" in os.environ.get("TPU_NAME", "").lower()
+            or "v5" in os.environ.get("ACCELERATOR_TYPE", "").lower()
+            or (args.device and "v5" in str(args.device).lower())
+            or os.environ.get("TPU_VERSION") == "v5e"
+        )
+        tpu_banner_name = "KAGGLE TPU v5e-8" if is_v5 else "KAGGLE TPU v3-8"
         print("\n" + "=" * 80)
-        print("  [>] SPAWNING 8-CORE DISTRIBUTED PRETRAINING ON KAGGLE TPU v3-8")
+        print(f"  [>] SPAWNING 8-CORE DISTRIBUTED PRETRAINING ON {tpu_banner_name}")
         print("=" * 80 + "\n", flush=True)
         xmp.spawn(_train_worker, args=(args,), nprocs=8, start_method="fork")
     else:

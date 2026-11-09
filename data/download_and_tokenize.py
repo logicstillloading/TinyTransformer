@@ -299,7 +299,7 @@ def download_and_tokenize(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download and Pre-Tokenize into NVMe Shards")
-    parser.add_argument("--target-tokens", type=int, default=10_000_000, help="Target total tokens (default: 10M)")
+    parser.add_argument("--target-tokens", "--tokens", type=int, default=10_000_000, dest="target_tokens", help="Target total tokens (default: 10M)")
     parser.add_argument("--shard-size", type=int, default=DEFAULT_SHARD_SIZE, help="Tokens per shard file (default: 5M)")
     parser.add_argument("--shard-dir", type=str, default="data/shards", help="Directory to save shards")
     parser.add_argument("--tokenizer", type=str, default="tokenizer.json", help="Path to tokenizer.json")
