@@ -2,10 +2,15 @@
 Automated Kaggle Dataset Packaging & Deployment Pipeline for TinyTransformer.
 
 Handles:
-1. Shard integrity scanning & token audit (Foundation + Instruction + Distillation).
+1. Shard integrity scanning & token audit (3.6B Foundation + 200M Instruction).
 2. Generates Kaggle-compliant dataset-metadata.json.
-3. Automatically triggers Kaggle CLI upload if API credentials exist, or provides
-   clean 1-click browser UI instructions.
+3. Automatically stages binary shards with zero-copy hardlinks (os.link) to keep disk space under 7.6GB.
+4. Triggers Kaggle CLI push or provides 1-click UI instructions.
+
+Tutorials & Documentation:
+- Master Kaggle TPU v5e-8 & Sharding Guide: KAGGLE_TPU_GUIDE.md
+- Sharding Notebook: TinyTransformer_Kaggle_Data_Sharding.ipynb
+- TPU Training Notebook: TinyTransformer_Kaggle_TPU_v5e_8.ipynb
 """
 
 import argparse

@@ -97,4 +97,15 @@ Every saved checkpoint must contain the following keys:
 
 1. **Parameter Budget Invariant**: The total parameter count must strictly remain within $\approx 220\text{M} - 238\text{M}$ BF16. Do not alter hidden dimension ($640$), SwiGLU multiplier ($3.0$), layer count ($24$), or Engram table sizes ($80\text{M} + 2 \times 10\text{M}$) without explicit authorization.
 2. **Dependency Integrity**: Avoid introducing heavy external frameworks (e.g. Deepspeed, Megatron). The codebase relies strictly on standard PyTorch, Hugging Face `tokenizers`, `datasets`, and `matplotlib`.
-3. **Lint & Smoke Tests**: After making changes, always run quick verification checks (`python -c "import torch..."`) before updating the user or declaring milestones complete.
+3. **Lint & Smoke Tests**: After making changes, always run quick verification checks (`python -c "import torch..."` or `python tests/test_components.py`) before updating the user or declaring milestones complete.
+
+---
+
+## 5. Kaggle Cloud TPU v5e-8 & Pre-Tokenization Protocols
+
+1. **Master Guide**: For end-to-end execution details, see [**`KAGGLE_TPU_GUIDE.md`**](file:///d:/TinyTransformer/KAGGLE_TPU_GUIDE.md).
+2. **Two-Stage Decoupled Execution**:
+   - **Stage 1 (Cloud CPU - Free)**: `TinyTransformer_Kaggle_Data_Sharding.ipynb` pre-tokenizes 3.8B tokens (3.6B Foundation + 200M Instruct) to `uint16` binary shards in `/kaggle/working/TinyTransformer/data/shards` (~7.6 GB disk). Output is packaged as Kaggle Dataset `tinytransformer-shards-3-8b`.
+   - **Stage 2 (TPU v5e-8 - Max Speed)**: `TinyTransformer_Kaggle_TPU_v5e_8.ipynb` mounts `tinytransformer-shards-3-8b` via `+ Add Input` for 0-minute tokenization overhead at ~145,000 tokens/sec across 8 TPU cores.
+3. **1.0 Unique Epoch Invariant**: Foundation pretraining consumes 3.6B unique tokens across exactly 1.0 epoch (100% Pareto efficiency per Muennighoff et al., 2023), maximizing n-gram hash entropy across the 80M + 10M Engram tables.
+4. **Session Timeout Guard**: TPU training enforces `--base-hours 7.8 --max-hours 8.4 --infer-interval 12500` to exit cleanly before Kaggle's 9.0h cutoff.

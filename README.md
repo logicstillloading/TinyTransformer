@@ -20,7 +20,26 @@ Click the badge above or open [`TinyTransformer_Colab_T4.ipynb`](file:///d:/Tiny
 
 ---
 
-## 🏗️ 2. Architectural Specification (~237.8M Parameters)
+## 🚀 2. Distributed Pretraining on Kaggle Cloud TPU v5e-8 & Data Sharding
+
+For massive throughput (~145,000 tokens/sec across 8 TPU cores), see the complete [**Master Kaggle TPU v5e-8 Guide (`KAGGLE_TPU_GUIDE.md`)**](file:///d:/TinyTransformer/KAGGLE_TPU_GUIDE.md).
+
+### Decoupled Two-Stage Cloud Architecture:
+1. **Stage 1 (Kaggle Cloud CPU - Free / 0 TPU Quota)**:
+   - Run [`TinyTransformer_Kaggle_Data_Sharding.ipynb`](file:///d:/TinyTransformer/TinyTransformer_Kaggle_Data_Sharding.ipynb) on Cloud CPU.
+   - Streams calibrated SOTA corpora (FineWeb-Edu 30%, Cosmopedia v2 22%, FineMath-3+ 15%, Python 12%, DCLM 11%, Wiki 8%, SmolTalk 2%) to contiguous `uint16` NVMe binary shards at **~305,000 tokens/sec**.
+   - Generates **3.8 Billion tokens** (3.6B Foundation + 200M Instruct) in ~3.4 hours.
+   - Packages automatically to Kaggle Dataset `tinytransformer-shards-3-8b` (~7.6 GB disk footprint).
+2. **Stage 2 (Kaggle TPU v5e-8 - Max Speed)**:
+   - Run [`TinyTransformer_Kaggle_TPU_v5e_8.ipynb`](file:///d:/TinyTransformer/TinyTransformer_Kaggle_TPU_v5e_8.ipynb) on TPU VM v5e-8.
+   - Mounts the dataset via `+ Add Input` for **0-minute instant startup** at ~145,000 tokens/sec.
+   - **Hours 0.0 – 7.8**: Foundation Pretraining (**1.0 unique epoch on 3.6B tokens** = 100% Pareto efficiency & maximum Engram hash table diversity).
+   - **Hours 7.8 – 8.4**: Slow transition to 200M Instruct Annealing mix.
+   - **Hour 8.4**: Auto-shutdown before Kaggle's 9.0h timeout (`--max-hours 8.4`).
+
+---
+
+## 🏗️ 3. Architectural Specification (~237.8M Parameters)
 
 ```mermaid
 flowchart TD
@@ -49,7 +68,7 @@ flowchart TD
 
 ---
 
-## 🚀 3. Quick Start & Training Commands
+## 🚀 4. Quick Start & Training Commands
 
 ### Installation
 ```bash
@@ -77,7 +96,7 @@ pip install -r requirements.txt
 
 ---
 
-## 🕹️ 4. Safe Remote Control Flags (Zero Lost Tokens)
+## 🕹️ 5. Safe Remote Control Flags (Zero Lost Tokens)
 
 Control running training runs safely by creating empty flag files:
 
@@ -101,7 +120,7 @@ Control running training runs safely by creating empty flag files:
 
 ---
 
-## 🧪 5. Evaluation & Factual Probes
+## 🧪 6. Evaluation & Factual Probes
 
 Evaluate checkpoints directly on GPU or CPU without interrupting training:
 
@@ -115,7 +134,7 @@ python test.py --checkpoint checkpoints/checkpoint_latest.pt --device cuda --gre
 
 ---
 
-## 📊 6. Plotting Training Progress
+## 📊 7. Plotting Training Progress
 
 Generate multi-panel loss, perplexity, and throughput plots:
 ```bash

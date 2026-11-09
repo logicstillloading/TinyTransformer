@@ -1,14 +1,25 @@
 """
-Chinchilla Target Data Downloader & NVMe Pre-Tokenization Pipeline.
-Streams one dataset at a time to keep host RAM under 150MB, writing contiguous
-uint16 binary shards to disk for instant zero-RAM memory-mapped training.
+High-Throughput NVMe Pre-Tokenization Pipeline for TinyTransformer (~238M).
+Streams datasets one at a time from Hugging Face to keep host RAM under 200MB,
+writing contiguous uint16 binary shards (5M tokens / ~9.5MB each) to disk.
 
-Mixture Ratio (SOTA SmolLM2-135M / MobileLLM Rebalanced):
-- 45% FineWeb-Edu Dedup (HuggingFaceTB/smollm-corpus, fineweb-edu-dedup)
-- 20% Cosmopedia v2 (HuggingFaceTB/smollm-corpus, cosmopedia-v2)
-- 15% Python-Edu (Avelina/python-edu-cleaned)
-- 15% FineMath-4plus (HuggingFaceTB/finemath, finemath-4plus)
-- 5% Instruction (HuggingFaceTB/smol-smoltalk)
+Dataset Mixture (Calibrated SOTA Recipe):
+Foundation Pretraining (3.60 Billion Unique Tokens - 1.0 Epoch):
+- 30% FineWeb-Edu Dedup (HuggingFaceTB/smollm-corpus, fineweb-edu-dedup) [Core anchor]
+- 22% Cosmopedia v2 (HuggingFaceTB/smollm-corpus, cosmopedia-v2) [Synthetic reasoning]
+- 15% FineMath-3plus (HuggingFaceTB/finemath, finemath-3plus) [K-12 & high school arithmetic]
+- 12% Python-Edu (Avelina/python-edu-cleaned) [Code algorithms & syntax]
+- 11% DCLM-100BT (HuggingFaceFW/dclm_100BT) [Human web diversity / anti-brittleness]
+- 8% Wikipedia en (wikimedia/wikipedia, 20231101.en) [Factual grounding]
+- 2% Instruction Warmup (HuggingFaceTB/smoltalk, apigen-80k) [Base dialogue alignment]
+
+Instruction Alignment (200 Million Tokens):
+- Multi-faceted SmolTalk mixture (Tools, CoT, Coding, Dialogue, Magpie, OpenHermes)
+
+Tutorials & Documentation:
+- Master Kaggle TPU v5e-8 & Sharding Guide: KAGGLE_TPU_GUIDE.md
+- Sharding Notebook: TinyTransformer_Kaggle_Data_Sharding.ipynb
+- TPU Training Notebook: TinyTransformer_Kaggle_TPU_v5e_8.ipynb
 """
 
 import argparse

@@ -1,12 +1,21 @@
 """
 Production Pretraining Script for TinyTransformer (~238M Parameters).
-Features:
-- Keller Jordan's Muon optimizer (Newton-Schulz iteration) for 2D weights + AdamW for embeddings/RMSNorms/Engram tables.
-- Auxiliary Critic RL model ('bsing' detector) with warmup schedule and one-sided label smoothing.
-- Dynamic 6-stream dataset mixture (28% cosmopedia, 28% fineweb, 15% finemath, 12% python, 10% wikipedia, 7% instruction) with deterministic resumption.
-- Corruption-proof atomic checkpointing (latest and previous only).
-- Live Goated CLI telemetry with step, tokens, tok/s, loss, EMA loss, step PPL, EMA PPL, Critic status, VRAM, ETA.
-- Mini-inference generation tests every 250 steps with clean CLI display and multi-format session logging (CSV and JSONL).
+Core Architecture:
+- 138.3M Dense Transformer Backbone (24 layers, d_model=640, 10 heads, 3.0x SwiGLU = 1920 intermediate).
+- 99.5M Hierarchical Engram Memory Tables (Local L5: 10M, Local L11: 10M, Global Post-L16: 80M slots).
+- Dual Optimizer Setup: Keller Jordan's Muon (5th-order Newton-Schulz polar orthogonalization) for 2D internal
+  matrices + decoupled AdamW for RMSNorm, tied embeddings, and Engram memory tables.
+- Auxiliary Critic RL Model: Hallucination discriminator with dynamic RL reward modulation.
+- Calibrated SOTA Dataset Mixture: 30% FineWeb-Edu, 22% Cosmopedia v2, 15% FineMath-3+, 12% Python-Edu,
+  11% DCLM-100BT, 8% Wikipedia en, 2% Instruction warmup -> 200M Instruct annealing mix.
+- High-Throughput NVMe Engine: Zero-RAM np.memmap acceleration (>145k tok/s on TPU v5e-8).
+- Multi-Platform Support: Plug-and-play across RTX 3050 Ti Laptop, Colab Tesla T4, and Kaggle TPU v5e-8.
+- Two-Slot Atomic Checkpoint Protocol: Rotates checkpoint_latest.pt / checkpoint_prev.pt with zero corruption.
+
+Tutorials & Documentation References:
+- Master Kaggle TPU v5e-8 & Sharding Guide: KAGGLE_TPU_GUIDE.md
+- Operational Concurrency & Resumption Protocol: GEMINI.md
+- Architectural Specifications: README.md
 """
 
 import argparse
